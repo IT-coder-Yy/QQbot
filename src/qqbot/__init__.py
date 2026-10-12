@@ -1,2 +1,9 @@
 def main() -> None:
-    print("Hello from qqbot!")
+    import asyncio
+
+    from .listen import main as listen
+
+    try:
+        asyncio.run(listen())
+    except KeyboardInterrupt:
+        pass

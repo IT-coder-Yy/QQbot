@@ -6,7 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
-from dotenv import load_dotenv
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
 
@@ -24,9 +23,6 @@ from .schema import (
     ToolResult as ToolResultRecord,
 )
 from .tools import ToolRegistry
-
-
-load_dotenv()
 
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -80,6 +76,7 @@ class Agent:
         context_manager: ContextManager,
         context_builder: ContextBuilder,
         tool_registry: ToolRegistry,
+        request_timeout: float = 60.0,
     ) -> None:
         self.context_manager = context_manager
         self.context_builder = context_builder
@@ -105,20 +102,14 @@ class Agent:
         # Agent Tool Loop
         # ====================================================
 
-        self.max_tool_steps = self._get_int_env("AGENT_MAX_TOOL_STEPS", default=6)
-        self.max_tool_result_tokens = self._get_int_env("TOOL_MAX_RESULT_TOKENS", default=4000)
+        self.max_tool_steps = 6
+        self.max_tool_result_tokens = 4000
 
         # ====================================================
         # Prompt
         # ====================================================
 
         self.system_prompt = SYSTEM_PROMPT_PATH.read_text(encoding="utf-8").strip()
-
-        # ====================================================
-        # LLM Client
-        # ====================================================
-
-        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url)
 
         # ====================================================
         # Context Harness
@@ -130,6 +121,8 @@ class Agent:
             max_output_tokens=self.max_output_tokens,
             safety_margin=self.safety_margin,
         )
+
+        self.client = AsyncOpenAI(api_key=self.api_key, base_url=self.base_url, timeout=request_timeout)
 
         # ====================================================
         # Context Compactor
@@ -249,20 +242,7 @@ class Agent:
 
                 run.finished_at = finished_at
 
-                # ---------------------------------------------
-                # Final Answer 才进入 Session History。
-                #
-                # Tool Call / Tool Result 不直接永久写进
-                # recent_messages。
-                # ---------------------------------------------
-
-                self.context_manager.record_assistant_message(
-                    conversation=(conversation),
-                    session=session,
-                    content=content,
-                    timestamp=(finished_at),
-                )
-
+                # 由调用方在 OneBot 确认发送成功后写入会话历史。
                 return content
 
             # =================================================
@@ -960,23 +940,6 @@ class Agent:
 
         if not value:
             raise RuntimeError(f"缺少环境变量: {name}")
-
-        try:
-            return int(value)
-
-        except ValueError as exc:
-            raise RuntimeError(f"环境变量 {name} 必须是整数") from exc
-
-    @staticmethod
-    def _get_int_env(
-        name: str,
-        *,
-        default: int,
-    ) -> int:
-        value = os.getenv(name)
-
-        if not value:
-            return default
 
         try:
             return int(value)

@@ -70,12 +70,13 @@ class ContextManager:
 
         return conversation, session, context_message
 
-    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime) -> ContextMessage:
+    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime, source_message_id: int | None = None) -> ContextMessage:
         context_message = ContextMessage(
             id=uuid4().hex,
             role=ContextRole.ASSISTANT,
             content=content,
             timestamp=timestamp,
+            source_message_id=source_message_id,
         )
 
         session.recent_messages.append(context_message)

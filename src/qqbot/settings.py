@@ -21,6 +21,8 @@ class Settings:
     reconnect_max_delay: float = 30.0
     intent_threshold: float = 0.75
     intent_recent_limit: int = 12
+    context_max_messages: int = 200
+    context_max_chars: int = 64_000
 
     @classmethod
     def from_env(cls) -> "Settings":

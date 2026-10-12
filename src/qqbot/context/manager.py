@@ -8,13 +8,17 @@ from qqbot.schema import (
     MessageReceived,
     Session,
 )
+from qqbot.settings import Settings
 
 from .store import InMemoryContextStore
 
 
 class ContextManager:
-    def __init__(self, store: InMemoryContextStore) -> None:
+    def __init__(self, store: InMemoryContextStore, *, settings: Settings | None = None) -> None:
         self.store = store
+        self.settings = settings or Settings()
+        if min(self.settings.context_max_messages, self.settings.context_max_chars) <= 0:
+            raise ValueError("上下文容量必须大于 0")
 
     def get_or_create_context(self, message: MessageReceived) -> tuple[Conversation, Session]:
         conversation = self.store.get_conversation(message.conversation_id)
@@ -58,13 +62,13 @@ class ContextManager:
             source_message_id=message.message_id,
         )
 
-        session.recent_messages.append(context_message)
+        self._append_message(session, context_message)
 
         session.updated_at = message.timestamp
 
         conversation.updated_at = message.timestamp
 
-        self.store.save_session(session)
+        self.save_session(session)
 
         self.store.save_conversation(conversation)
 
@@ -79,17 +83,26 @@ class ContextManager:
             source_message_id=source_message_id,
         )
 
-        session.recent_messages.append(context_message)
+        self._append_message(session, context_message)
 
         session.updated_at = timestamp
 
         conversation.updated_at = timestamp
 
-        self.store.save_session(session)
+        self.save_session(session)
 
         self.store.save_conversation(conversation)
 
         return context_message
+
+    @staticmethod
+    def _message_chars(message: ContextMessage) -> int:
+        return len(message.content) + len(message.sender_name or "")
+
+    def _append_message(self, session: Session, message: ContextMessage) -> None:
+        # 超长消息仍完整传给本轮 Agent/Jev，但不长期保留，也不清空已有历史。
+        if self._message_chars(message) <= self.settings.context_max_chars:
+            session.recent_messages.append(message)
 
     def save_session(self, session: Session) -> None:
         """
@@ -97,6 +110,14 @@ class ContextManager:
         通过 ContextManager 写回 Store。
         """
 
+        chars = 0
+        keep = 0
+        for message in reversed(session.recent_messages[-self.settings.context_max_messages :]):
+            chars += self._message_chars(message)
+            if chars > self.settings.context_max_chars:
+                break
+            keep += 1
+        del session.recent_messages[: len(session.recent_messages) - keep]
         self.store.save_session(session)
 
     def _create_session(self, *, conversation: Conversation, timestamp: datetime) -> Session:

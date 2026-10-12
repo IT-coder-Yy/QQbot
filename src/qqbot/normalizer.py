@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 from datetime import datetime
-from zoneinfo import ZoneInfo
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .schema import (
     Content,
@@ -60,9 +60,7 @@ def normalize_event(event: dict[str, Any]) -> DomainEvent | None:
 # ============================================================
 
 
-def _normalize_message(
-    event: dict[str, Any],
-) -> MessageReceived | None:
+def _normalize_message(event: dict[str, Any]) -> MessageReceived | None:
 
     message_type = event.get("message_type")
 
@@ -93,13 +91,9 @@ def _normalize_message(
     raw_segments = event.get("message", [])
 
     if not isinstance(raw_segments, list):
-        raise ValueError(
-            "Normalizer 要求 NapCat 使用 Array 消息格式"
-        )
+        raise ValueError("Normalizer 要求 NapCat 使用 Array 消息格式")
 
-    content, unhandled_segments = _normalize_content(
-        raw_segments
-    )
+    content, unhandled_segments = _normalize_content(raw_segments)
 
     sender_data = event.get("sender") or {}
 
@@ -107,9 +101,7 @@ def _normalize_message(
         id=user_id,
         nickname=sender_data.get("nickname"),
         card=sender_data.get("card"),
-        role=_normalize_sender_role(
-            sender_data.get("role")
-        ),
+        role=_normalize_sender_role(sender_data.get("role")),
     )
 
     metadata = _build_message_metadata(
@@ -135,9 +127,7 @@ def _normalize_message(
 # ============================================================
 
 
-def _normalize_content(
-    segments: list[dict[str, Any]],
-) -> tuple[list[Content], list[dict[str, Any]]]:
+def _normalize_content(segments: list[dict[str, Any]]) -> tuple[list[Content], list[dict[str, Any]]]:
 
     content: list[Content] = []
 
@@ -150,11 +140,7 @@ def _normalize_content(
         data = segment.get("data") or {}
 
         if segment_type == "text":
-            content.append(
-                TextContent(
-                    text=str(data.get("text", ""))
-                )
-            )
+            content.append(TextContent(text=str(data.get("text", ""))))
 
             continue
 
@@ -195,11 +181,7 @@ def _normalize_content(
             reply_id = data.get("id")
 
             if reply_id is not None:
-                content.append(
-                    ReplyContent(
-                        message_id=int(reply_id)
-                    )
-                )
+                content.append(ReplyContent(message_id=int(reply_id)))
 
             continue
 
@@ -213,9 +195,7 @@ def _normalize_content(
 # ============================================================
 
 
-def _normalize_recall(
-    event: dict[str, Any],
-) -> MessageRecalled:
+def _normalize_recall(event: dict[str, Any]) -> MessageRecalled:
 
     notice_type = event["notice_type"]
 
@@ -227,9 +207,7 @@ def _normalize_recall(
 
         group_id = int(event["group_id"])
 
-        operator_id = int(
-            event.get("operator_id", user_id)
-        )
+        operator_id = int(event.get("operator_id", user_id))
 
     else:
         conversation_type = ConversationType.PRIVATE
@@ -264,9 +242,7 @@ def _normalize_recall(
 # ============================================================
 
 
-def _normalize_file_upload(
-    event: dict[str, Any],
-) -> FileUploaded:
+def _normalize_file_upload(event: dict[str, Any]) -> FileUploaded:
 
     bot_id = int(event["self_id"])
     user_id = int(event["user_id"])
@@ -309,29 +285,18 @@ def _normalize_file_upload(
 # ============================================================
 
 
-def _build_conversation_id(
-    *,
-    bot_id: int,
-    conversation_type: ConversationType,
-    user_id: int,
-    group_id: int | None,
-) -> str:
+def _build_conversation_id(*, bot_id: int, conversation_type: ConversationType, user_id: int, group_id: int | None) -> str:
 
     if conversation_type is ConversationType.GROUP:
-
         if group_id is None:
-            raise ValueError(
-                "群聊事件必须存在 group_id"
-            )
+            raise ValueError("群聊事件必须存在 group_id")
 
         return f"qq:group:{bot_id}:{group_id}"
 
     return f"qq:private:{bot_id}:{user_id}"
 
 
-def _normalize_sender_role(
-    role: Any,
-) -> SenderRole:
+def _normalize_sender_role(role: Any) -> SenderRole:
 
     if role == "owner":
         return SenderRole.OWNER
@@ -351,10 +316,8 @@ def _normalize_timestamp(timestamp: Any) -> datetime:
         tz=ZoneInfo("Asia/Shanghai"),
     )
 
-def _build_message_metadata(
-    event: dict[str, Any],
-    unhandled_segments: list[dict[str, Any]],
-) -> dict[str, Any]:
+
+def _build_message_metadata(event: dict[str, Any], unhandled_segments: list[dict[str, Any]]) -> dict[str, Any]:
 
     metadata_keys = (
         "raw_message",
@@ -367,15 +330,9 @@ def _build_message_metadata(
         "group_name",
     )
 
-    metadata = {
-        key: event[key]
-        for key in metadata_keys
-        if key in event
-    }
+    metadata = {key: event[key] for key in metadata_keys if key in event}
 
     if unhandled_segments:
-        metadata["unhandled_segments"] = (
-            unhandled_segments
-        )
+        metadata["unhandled_segments"] = unhandled_segments
 
     return metadata

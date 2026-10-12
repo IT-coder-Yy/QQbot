@@ -42,39 +42,46 @@ async def handle_message(
         return
     # 断线时保留任务，且不继续消耗模型额度；外层总期限仍然计时。
     await transport.wait_connected()
-    conversation, session, current_turn = context_manager.record_user_message(message)
-    if route is RouteDecision.INTENT:
-        if intent_detector is None:
-            return
-        try:
-            async with asyncio.timeout(intent_timeout):
-                intent = await intent_detector.detect(session=session, current_turn=current_turn)
-        except Exception:
-            logger.exception("意图判断失败，保持沉默 conversation=%s message=%s", message.conversation_id, message.message_id)
-            return
-        if not intent.should_reply:
-            return
+    # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
+    with context_manager.processing(message) as (conversation, session, current_turn):
+        if route is RouteDecision.INTENT:
+            if intent_detector is None:
+                return
+            try:
+                async with asyncio.timeout(intent_timeout):
+                    intent = await intent_detector.detect(session=session, current_turn=current_turn)
+            except Exception:
+                logger.exception("意图判断失败，保持沉默 conversation=%s message=%s", message.conversation_id, message.message_id)
+                return
+            if not intent.should_reply:
+                return
 
-    reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
-    if not reply.strip():
-        raise RuntimeError("模型返回了空白回复")
-    if asyncio.get_running_loop().time() >= job.deadline:
-        raise TimeoutError
-    # 从这里开始超时不能再补发“失败”提示：原回复可能已经送达。
-    job.reply_started = True
-    message_id = await transport.reply_text(
-        message,
-        reply,
-        quote=message.conversation_type is ConversationType.GROUP,
-        deadline=job.deadline,
-    )
-    context_manager.record_assistant_message(
-        conversation=conversation,
-        session=session,
-        content=reply,
-        timestamp=datetime.now(tz=message.timestamp.tzinfo),
-        source_message_id=message_id,
-    )
+        reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
+        if not reply.strip():
+            raise RuntimeError("模型返回了空白回复")
+        if asyncio.get_running_loop().time() >= job.deadline:
+            raise TimeoutError
+        # 从这里开始超时不能再补发“失败”提示：原回复可能已经送达。
+        job.reply_started = True
+        message_id = await transport.reply_text(
+            message,
+            reply,
+            quote=message.conversation_type is ConversationType.GROUP,
+            deadline=job.deadline,
+        )
+        context_manager.record_assistant_message(
+            conversation=conversation,
+            session=session,
+            content=reply,
+            timestamp=datetime.now(tz=message.timestamp.tzinfo),
+            source_message_id=message_id,
+        )
+
+
+async def cleanup_contexts(context_manager: ContextManager) -> None:
+    while True:
+        await asyncio.sleep(context_manager.settings.context_cleanup_interval)
+        context_manager.cleanup_expired()
 
 
 async def receive_events(websocket, transport: NapCatTransport, dispatcher: MessageDispatcher) -> None:
@@ -128,7 +135,7 @@ async def main() -> None:
     load_dotenv()
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     settings = Settings.from_env()
-    context_manager = ContextManager(store=InMemoryContextStore())
+    context_manager = ContextManager(store=InMemoryContextStore(), settings=settings)
     tool_registry = build_default_tool_registry()
     logger.info("已加载工具: %s", ", ".join(tool_registry.names))
 
@@ -171,7 +178,12 @@ async def main() -> None:
 
         dispatcher = MessageDispatcher(settings, process, send_notice)
         stack.push_async_callback(dispatcher.close)
-        await serve(settings, transport, dispatcher)
+        cleanup_task = asyncio.create_task(cleanup_contexts(context_manager), name="context-cleanup")
+        try:
+            await serve(settings, transport, dispatcher)
+        finally:
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

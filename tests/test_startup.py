@@ -58,9 +58,11 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_jev_key_does_not_prevent_startup_and_resources_close(self):
         fake_agent = SimpleNamespace(client=SimpleNamespace(close=AsyncMock()))
         captured = []
+        cleanup_tasks = []
 
         async def serve_once(settings, transport, dispatcher):
             captured.extend([transport, dispatcher])
+            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() == "context-cleanup")
 
         with patch.dict(os.environ, {"NAPCAT_TOKEN": "test"}, clear=True), patch("qqbot.listen.load_dotenv"), patch("qqbot.listen.logging.basicConfig"), patch("qqbot.listen.Agent", return_value=fake_agent), patch("qqbot.listen.AsyncTypeSafeClient") as jev, patch("qqbot.listen.serve", side_effect=serve_once):
             await main()
@@ -68,14 +70,18 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         fake_agent.client.close.assert_awaited_once()
         self.assertTrue(captured[0]._closed)
         self.assertTrue(captured[1]._closed)
+        self.assertEqual(len(cleanup_tasks), 1)
+        self.assertTrue(cleanup_tasks[0].cancelled())
 
     async def test_cancelling_service_cleans_all_resources(self):
         fake_agent = SimpleNamespace(client=SimpleNamespace(close=AsyncMock()))
         ready = asyncio.Event()
         captured = []
+        cleanup_tasks = []
 
         async def serve_forever(settings, transport, dispatcher):
             captured.extend([transport, dispatcher])
+            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() == "context-cleanup")
             ready.set()
             await asyncio.Event().wait()
 
@@ -88,6 +94,8 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         fake_agent.client.close.assert_awaited_once()
         self.assertTrue(captured[0]._closed)
         self.assertTrue(captured[1]._closed)
+        self.assertEqual(len(cleanup_tasks), 1)
+        self.assertTrue(cleanup_tasks[0].cancelled())
 
     async def test_real_agent_tool_loop_returns_answer_without_recording_unsent_reply(self):
         def response(content=None, calls=None):

@@ -11,7 +11,7 @@ from websockets.exceptions import InvalidStatus
 from websockets.http11 import Response
 
 from qqbot.context import ContextManager, InMemoryContextStore
-from qqbot.dispatcher import MessageDispatcher
+from qqbot.dispatcher import MessageDispatcher, MessageJob
 from qqbot.listen import handle_message, receive_events, serve
 from qqbot.schema import ContextRole
 from qqbot.settings import Settings
@@ -132,6 +132,52 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         await eventually(lambda: self.history())
         self.agent.run.assert_not_awaited()
         self.assertFalse(self.ws.sent)
+
+    async def test_silent_group_traffic_keeps_only_bounded_recent_history(self):
+        for intent in [None, SimpleNamespace(detect=AsyncMock(return_value=SimpleNamespace(should_reply=False)))]:
+            with self.subTest(intent_enabled=intent is not None):
+                self.manager = ContextManager(InMemoryContextStore(), settings=replace(self.settings, context_max_messages=5))
+                for message_id in range(300):
+                    incoming = message(message_id, group_id=30)
+                    await handle_message(MessageJob(incoming, asyncio.get_running_loop().time() + 1), context_manager=self.manager, agent=self.agent, intent_detector=intent, transport=self.transport, intent_timeout=0.1)
+                    if message_id % 50 == 0:
+                        await asyncio.sleep(0)
+                self.assertEqual([entry.source_message_id for entry in self.history()], list(range(295, 300)))
+                self.assertFalse(self.manager._active)
+                self.agent.run.assert_not_awaited()
+                self.assertFalse(self.ws.sent)
+
+    async def test_context_is_protected_until_acknowledgement_arrives(self):
+        self.manager = ContextManager(InMemoryContextStore(), settings=replace(self.settings, context_idle_timeout=10))
+        with patch("qqbot.context.manager.monotonic", return_value=0) as clock:
+            await self.feed(raw_message())
+            await eventually(lambda: self.ws.sent)
+            clock.return_value = 20
+            self.manager.cleanup_expired()
+            self.assertEqual(len(self.history()), 1)
+            await self.feed(success(self.ws.sent[0]))
+            await eventually(lambda: not self.dispatcher._workers)
+            self.manager.cleanup_expired()
+            self.assertEqual(len(self.history()), 2)
+            clock.return_value = 30
+            self.manager.cleanup_expired()
+            self.assertFalse(self.manager.store.conversations)
+            self.assertFalse(self.manager.store.sessions)
+
+    async def test_cancelled_model_call_releases_context_for_eviction(self):
+        self.manager = ContextManager(InMemoryContextStore(), settings=replace(self.settings, context_max_conversations=1))
+
+        async def wait_forever(**kwargs):
+            await asyncio.Event().wait()
+
+        self.agent.run.side_effect = wait_forever
+        await self.feed(raw_message())
+        await eventually(lambda: self.agent.run.await_count == 1)
+        original_id = message().conversation_id
+        await self.dispatcher.close()
+        self.manager.record_user_message(message(user_id=21))
+        self.assertNotIn(original_id, self.manager.store.conversations)
+        self.assertFalse(self.manager._active)
 
     async def test_reconnect_keeps_generated_unsent_reply_without_rerunning_model(self):
         gate = asyncio.Event()

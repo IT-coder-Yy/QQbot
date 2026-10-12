@@ -23,6 +23,9 @@ class Settings:
     intent_recent_limit: int = 12
     context_max_messages: int = 200
     context_max_chars: int = 64_000
+    context_max_conversations: int = 256
+    context_idle_timeout: float = 24 * 60 * 60
+    context_cleanup_interval: float = 60.0
 
     @classmethod
     def from_env(cls) -> "Settings":

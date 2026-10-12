@@ -1,4 +1,8 @@
+from collections import OrderedDict
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime
+from time import monotonic
 from uuid import uuid4
 
 from qqbot.schema import (
@@ -17,13 +21,47 @@ class ContextManager:
     def __init__(self, store: InMemoryContextStore, *, settings: Settings | None = None) -> None:
         self.store = store
         self.settings = settings or Settings()
-        if min(self.settings.context_max_messages, self.settings.context_max_chars) <= 0:
-            raise ValueError("上下文容量必须大于 0")
+        if min(self.settings.context_max_messages, self.settings.context_max_chars, self.settings.context_max_conversations, self.settings.context_idle_timeout, self.settings.context_cleanup_interval) <= 0:
+            raise ValueError("上下文容量和清理间隔必须大于 0")
+        self._last_used: OrderedDict[str, float] = OrderedDict()
+        self._active: set[str] = set()
+
+    @contextmanager
+    def processing(self, message: MessageReceived) -> Iterator[tuple[Conversation, Session, ContextMessage]]:
+        context = self.record_user_message(message)
+        self._active.add(message.conversation_id)
+        try:
+            yield context
+        finally:
+            self._active.remove(message.conversation_id)
+            self._touch(message.conversation_id)
+
+    def cleanup_expired(self) -> None:
+        now = monotonic()
+        for conversation_id, last_used in list(self._last_used.items()):
+            if now - last_used < self.settings.context_idle_timeout:
+                break
+            if conversation_id not in self._active:
+                self._delete_context(conversation_id)
+
+    def _touch(self, conversation_id: str) -> None:
+        self._last_used[conversation_id] = monotonic()
+        self._last_used.move_to_end(conversation_id)
+
+    def _delete_context(self, conversation_id: str) -> None:
+        self.store.delete_conversation(conversation_id)
+        del self._last_used[conversation_id]
 
     def get_or_create_context(self, message: MessageReceived) -> tuple[Conversation, Session]:
+        self.cleanup_expired()
         conversation = self.store.get_conversation(message.conversation_id)
 
         if conversation is None:
+            if len(self.store.conversations) >= self.settings.context_max_conversations:
+                oldest_idle = next((key for key in self._last_used if key not in self._active), None)
+                if oldest_idle is None:
+                    raise RuntimeError("上下文容量已满，所有会话都在处理中")
+                self._delete_context(oldest_idle)
             conversation = Conversation(
                 conversation_id=message.conversation_id,
                 conversation_type=message.conversation_type,
@@ -44,6 +82,7 @@ class ContextManager:
                 timestamp=message.timestamp,
             )
 
+        self._touch(message.conversation_id)
         return (
             conversation,
             session,
@@ -92,6 +131,7 @@ class ContextManager:
         self.save_session(session)
 
         self.store.save_conversation(conversation)
+        self._touch(conversation.conversation_id)
 
         return context_message
 

@@ -9,8 +9,10 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.141.1",
+    "httpx>=0.28.1",
     "openai>=3.16.2",
     "python-dotenv>=1.2.3",
+    "typesafe-sdk>=0.7.0",
     "websockets>=17.1",
 ]
 

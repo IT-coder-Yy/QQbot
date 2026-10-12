@@ -1,86 +1,95 @@
 # QQBot
 
-基于 NapCat、OneBot 11 反向 WebSocket 和 OpenAI 兼容接口的 QQ 聊天机器人。
+基于 NapCat、OneBot 11 正向 WebSocket 和 OpenAI 兼容接口的 QQ 聊天机器人。QQBot 作为客户端连接 NapCat 的 WebSocket 服务端。
 
 ## 当前功能
 
-- 通过 WebSocket 接收 NapCat 推送的私聊和群聊消息
-- 自动忽略机器人自己发送的消息
-- 私聊消息直接处理，群聊消息仅在 @ 机器人时处理
-- 调用 OpenAI 兼容的聊天接口生成回复
-- 按会话保留最近 20 条消息上下文
-- 使用 QQ 引用消息进行回复
-- 将 OneBot 消息转换为内部统一模型，并保留暂未支持的消息段
+- 私聊、群聊 @Bot 直接回复；配置 Jev 后，普通群聊消息也可经过意图判断触发回复。
+- 主模型支持多轮工具调用：计算器、时间、天气，以及可选的 Tavily 网页搜索。
+- 会话上下文保存在内存中，按 Token 预算压缩旧历史为摘要。
+- 同一会话顺序处理，不同会话有限并发；群聊回复引用触发消息。
+- 网络异常自动退避重连；接收循环独立分发事件与发送回执。
+- 消息去重、有界排队、任务总超时、限频的繁忙和错误提示。
 
-当前监听流程只会处理消息事件；撤回和群文件事件已经定义了内部模型，但还没有接入业务处理流程。
+图片、引用、撤回和群文件已有部分内部模型，但图片理解、引用内容读取、撤回历史更新和文件处理尚未接入。长期记忆和跨重启任务恢复尚未实现。
 
-## 环境要求
+## 安装与配置
 
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
-- 已运行并配置 OneBot 11 反向 WebSocket 的 NapCat
-- 一个 OpenAI 兼容的 LLM API
-
-## 安装
+要求 Python 3.12+、uv、已运行的 NapCat，以及支持工具调用的 OpenAI 兼容模型接口。
 
 ```bash
 uv sync
-```
-
-复制环境变量模板：
-
-```bash
 cp .env.example .env
 ```
 
-然后编辑 `.env`：
+在 NapCat 中启用**正向 WebSocket 服务端**，配置 Token 和 Array 消息格式，然后填写 `.env`。已有 `.env` 时直接补充配置，不要覆盖原凭据。
 
-| 变量 | 说明 | 示例 |
-| --- | --- | --- |
-| `NAPCAT_WS_URL` | NapCat 反向 WebSocket 地址 | `ws://127.0.0.1:3001` |
-| `NAPCAT_TOKEN` | NapCat WebSocket 鉴权 Token | 必填 |
-| `LLM_API_KEY` | LLM API 密钥 | 必填 |
-| `LLM_BASE_URL` | OpenAI 兼容 API 地址 | `https://api.deepseek.com` |
-| `LLM_MODEL` | 使用的模型名称 | `deepseek-flash` |
+| 变量 | 说明 |
+| --- | --- |
+| `NAPCAT_WS_URL` | NapCat 正向 WebSocket 地址，默认 `ws://127.0.0.1:3001` |
+| `NAPCAT_TOKEN` | 必填，NapCat WebSocket 鉴权 Token |
+| `LLM_API_KEY` | 必填，主模型密钥 |
+| `LLM_BASE_URL` | 必填，OpenAI 兼容接口地址 |
+| `LLM_MODEL` | 必填，模型名称 |
+| `LLM_CONTEXT_WINDOW` | 必填，所选模型支持的上下文 Token 上限 |
+| `LLM_MAX_OUTPUT_TOKENS` | 必填，单次输出 Token 上限 |
+| `LLM_CONTEXT_SAFETY_MARGIN` | 必填，Token 估算误差的预留空间 |
+| `TYPESAFE_API_KEY` | 可选；未配置时仅响应私聊和 @Bot |
+| `TYPESAFE_DEFAULT_MODEL` | Jev 模型，默认 `jev-latest` |
+| `TAVILY_SEARCH_API_KEY` | 可选；配置后注册网页搜索工具 |
 
-不要将 `.env` 或 API 密钥提交到 Git；`.env.example` 可以提交并用于说明配置格式。
+三个 Token 配置需按模型实际限制填写，输出上限与预留空间之和必须小于上下文上限。`.env` 和 API 密钥不要提交到 Git。
+
+`.env` 只维护上述连接、模型与密钥配置。超时、并发、队列、重连、去重及意图判断参数直接在 [settings.py](src/qqbot/settings.py) 中调整；工具调用轮数和结果长度限制在 [agent.py](src/qqbot/agent.py) 中调整。原有运行参数环境变量不再生效，代码中的默认值保持不变。
 
 ## 运行
 
-启动消息监听器：
+以下两种方式都启动监听器：
 
 ```bash
+uv run qqbot
 uv run python -m qqbot.listen
 ```
 
-正常连接后会输出：
+成功连接后日志会输出“已连接 NapCat”。按 Ctrl+C 退出会取消未完成任务并关闭连接和客户端。
 
-```text
-已连接 NapCat
-```
+## 消息可靠性边界
 
-程序会打印收到的消息，并将符合路由条件的消息交给 LLM。群聊消息必须 @ 当前机器人，私聊消息则会直接处理。
+- 接收循环不等待模型执行或队列空位，确保队列满时仍可处理发送回执。
+- 任务总期限覆盖排队、意图判断、主模型、工具、等待重连和发送确认；重连不重新计时。
+- 队列满时拒绝新消息；等待到期则放弃该任务。私聊和 @Bot 尝试发送一次限频提示，普通群聊自动接话可以跳过。
+- 故障提示只在当前连接可用时尝试一次，有独立的并发上限和发送超时；断线或提示额度已满时可能保持沉默。
+- 仅在收到 `status=ok`、`retcode=0` 且包含 `message_id` 的同步回执后，将机器人回复写入历史。
+- 明确失败、回执超时、中途断线、异步回执或不完整回执不会自动重发。发送结果未知时只记录日志，不补发“发送失败”提示，避免重复回复。
+- 尚未尝试发送的任务可在原期限内等待重连；已经发起发送的任务不会在新连接上重放。
+- 去重键是 `(conversation_id, message_id)`。已接纳、已拒绝和失败的事件都计入去重缓存，正在排队或执行的事件另行保护。用户主动重试需发送一条新消息。
+- **全部状态仅在当前进程内保存**。不保证跨重启恢复、恰好一次投递或补回断线期间未收到的消息。会话历史也会随重启丢失。
+- 鉴权失败等非暂时性连接错误会终止启动，应修正配置后重新运行。
 
 ## 项目结构
 
 ```text
 src/qqbot/
-├── agent.py       # LLM 客户端和会话上下文
-├── context.py     # 内存中的会话历史
-├── listen.py      # WebSocket 监听入口
+├── agent.py       # 主模型与工具调用循环
+├── context/       # 内存会话、Token 预算和摘要压缩
+├── dispatcher.py  # 会话队列、并发、去重、总超时及提示限频
+├── intent.py      # Jev 意图判断
+├── listen.py      # 生命周期、独立接收循环和重连
 ├── normalizer.py  # OneBot 事件归一化
-├── router.py      # 消息路由规则
-├── schema.py      # 内部事件和消息模型
-├── system.md      # Agent 系统提示词
-└── transport.py   # NapCat 消息发送
+├── prompts/       # 系统、意图和摘要提示词
+├── router.py      # 确定性回复规则
+├── schema.py      # 内部数据模型
+├── settings.py    # 运行配置与启动校验
+├── tools/         # 工具实现与注册
+└── transport.py   # OneBot 发送、回执关联和结果判断
 ```
 
-## 开发
+## 验证
 
-依赖和锁文件由 uv 管理。修改依赖后同步环境：
+测试使用标准库 unittest，模拟模型与 WebSocket；不读取真实 `.env`，不连接 QQ 或外部 API。
 
 ```bash
-uv sync
+uv run python -m unittest discover -s tests -v
 ```
 
-当前仓库尚未配置自动化测试；启动监听器前请确认 NapCat 已连接到与 `NAPCAT_WS_URL` 相同的反向 WebSocket 地址。
+覆盖消息顺序、并发/队列上限、重复事件、回执乱序和丢失、断线恢复、任务期限、历史写入时机、可选 Jev、配置校验和退出清理。真实 NapCat、模型及工具服务的联调需另行进行。

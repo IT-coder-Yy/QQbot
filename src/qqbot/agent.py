@@ -25,7 +25,7 @@ from .schema import (
     ToolResult as ToolResultRecord,
 )
 from .tools import ToolRegistry
-from .reply import CHAT_REPLY_INSTRUCTIONS, GROUP_REPLY_INSTRUCTIONS
+from .reply import CHAT_REPLY_INSTRUCTIONS, GROUP_REPLY_INSTRUCTIONS, extract_final_answer
 
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -202,6 +202,7 @@ class Agent:
         runtime_messages: list[ChatCompletionMessageParam] = []
 
         tool_round = 0
+        empty_retried = False
 
         while True:
             # =================================================
@@ -234,10 +235,16 @@ class Agent:
             # =================================================
 
             if not tool_calls:
-                content = response_message.content
+                content = extract_final_answer(response_message.content or "")
+
                 if not content:
-                    return "模型没有返回内容。"
-                content = content.strip()
+                    logger.warning("主模型返回空回复 model=%s response_id=%s finish_reason=%s refusal=%s retry=%s",
+                                   self.model, getattr(response, "id", None),
+                                   getattr(response.choices[0], "finish_reason", None), bool(getattr(response_message, "refusal", None)), not empty_retried)
+                    if not empty_retried:
+                        empty_retried = True
+                        continue
+                    return "刚刚没能答上来，能再问我一次吗？"
 
                 finished_at = datetime.now(tz=(current_turn.timestamp.tzinfo))
 
@@ -623,7 +630,7 @@ class Agent:
         # ====================================================
 
         if message.role is ContextRole.ASSISTANT:
-            content = message.content
+            content = extract_final_answer(message.content)
             if message.source_message_id is not None:
                 content = f"[消息ID:{message.source_message_id}] {content}"
             reply_id = message.metadata.get("reply_to_message_id")

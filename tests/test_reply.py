@@ -2,13 +2,16 @@ import asyncio
 import contextlib
 import io
 import os
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from qqbot.agent import Agent
 from qqbot.context import ContextBuilder, ContextManager, InMemoryContextStore
+from qqbot.context.sqlite_store import SQLiteContextStore
 from qqbot.dispatcher import MessageJob
 from qqbot.listen import handle_message
 from qqbot.reply import MESSAGE_BREAK, QUOTE_MARKER
@@ -73,11 +76,77 @@ class ReplyPolicyTests(unittest.IsolatedAsyncioTestCase):
         return [entry.content for session in self.manager.store.sessions.values()
                 for entry in session.recent_messages if entry.role is ContextRole.ASSISTANT]
 
+    async def test_thinking_in_content_never_reaches_send_or_history(self):
+        variants = [
+            '内部分析占位\n' + MESSAGE_BREAK + '\n</think>\n笑啥呢',
+            '内部分析占位</think>笑啥呢',
+            '<think>内部分析占位</think>\n笑啥呢',
+            '<think>内部分析占位\n```text\n</think>\n```\n</think>笑啥呢',
+        ]
+        for index, content in enumerate(variants, 1):
+            with self.subTest(content=content):
+                self.completion.return_value = response(content)
+                sent_before = len(self.ws.sent)
+                segments = await self.deliver(message(index, group_id=30, mentioned=True))
+                self.assertEqual(segments, [{'type': 'text', 'data': {'text': '笑啥呢'}}])
+                self.assertEqual(len(self.ws.sent), sent_before + 1)
+        self.assertEqual(self.replies(), ['笑啥呢'] * len(variants))
+        self.assertEqual(self.completion.await_count, len(variants))
 
+    async def test_reasoning_only_uses_existing_retry_without_sending_analysis(self):
+        for index, content in enumerate(('<think>尚未结束的内部分析', '<think>内部分析</think>', '内部分析\n</think>'), 1):
+            with self.subTest(content=content):
+                self.completion.side_effect = [response(content), response('嘿嘿')]
+                with self.assertLogs('qqbot.agent', level='WARNING'):
+                    segments = await self.deliver(message(index))
+                self.assertEqual(segments, [{'type': 'text', 'data': {'text': '嘿嘿'}}])
+                self.assertEqual(self.completion.await_args_list[-2].kwargs['messages'], self.completion.await_args_list[-1].kwargs['messages'])
+        self.assertEqual(self.replies(), ['嘿嘿'] * 3)
 
+    async def test_two_reasoning_only_responses_use_natural_failure_reply(self):
+        self.completion.return_value = response('<think>只有内部分析</think>')
+        with self.assertLogs('qqbot.agent', level='WARNING'):
+            await self.deliver(message())
+        self.completion.assert_awaited()
+        self.assertEqual(self.completion.await_count, 2)
+        self.assertEqual(self.replies(), ['刚刚没能答上来，能再问我一次吗？'])
 
+    async def test_separate_reasoning_stays_in_tool_context_and_out_of_reply(self):
+        tool_call = SimpleNamespace(id='call-1', function=SimpleNamespace(name='calculator', arguments='{"expression":"2+3"}'))
+        first = response(calls=[tool_call])
+        first.choices[0].message.reasoning_content = '工具轮内部分析占位'
+        final = response('内部分析占位\n</think>\n<qqbot-quote:12/>\n答案是 5' + MESSAGE_BREAK + '算好啦')
+        final.choices[0].message.reasoning_content = '独立内部分析占位'
+        self.completion.side_effect = [first, final]
+        await self.deliver(message(12, group_id=30, mentioned=True))
+        request = self.completion.await_args.kwargs['messages']
+        self.assertEqual(request[-2]['reasoning_content'], '工具轮内部分析占位')
+        self.assertEqual(self.ws.sent[0]['params']['message'][0], {'type': 'reply', 'data': {'id': '12'}})
+        self.assertEqual(self.replies(), ['答案是 5', '算好啦'])
 
+    async def test_old_thinking_is_hidden_from_model_without_rewriting_archive(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = SQLiteContextStore(root / 'bot.db', root / 'files')
+        self.addCleanup(store.close)
+        self.manager = ContextManager(store, settings=replace(Settings(), reply_interval=0))
+        self.agent.context_manager = self.manager
+        incoming = message(1, group_id=30, mentioned=True)
+        conversation, session, _ = self.manager.record_user_message(incoming)
+        old = '旧内部分析占位\n</think>\n笑啥呢'
+        self.manager.record_assistant_message(conversation=conversation, session=session, content=old,
+                                             timestamp=incoming.timestamp, source_message_id=501, reply_to_message_id=1)
+        self.completion.return_value = response('<think>新内部分析</think>嘿嘿')
+        await self.deliver(message(2, group_id=30, mentioned=True))
+        request = self.completion.await_args.kwargs['messages']
+        self.assertEqual(request[2]['content'], '[引用消息ID:1] [消息ID:501] 笑啥呢')
+        archived = [item['content'] for item in store.history(incoming.conversation_id) if item['role'] == 'assistant']
+        self.assertEqual(archived, [old, '嘿嘿'])
 
+    async def test_literal_think_tags_in_code_and_prose_are_preserved(self):
+        answer = '结束标签是 `</think>`，字面文本是 <think>。\n```xml\n<think>示例</think>\n</think>\n```\n~~~text\n</think>\n~~~'
+        self.completion.return_value = response(answer)
+        await self.deliver(message())
+        self.assertEqual(self.replies(), [answer])
 
 
 
@@ -97,8 +166,37 @@ class ReplyPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("引用消息ID=1", request[-1]["content"])
         self.assertEqual(self.replies(), ["好呀，一起去。"])
 
+    async def test_empty_model_reply_uses_natural_notice_and_logs_finish_reason(self):
+        for index, content in enumerate((None, '', ' \n\t')):
+            with self.subTest(content=content):
+                result = response(content)
+                result.id = 'empty-response'
+                result.choices[0].finish_reason = 'stop'
+                self.completion.return_value = result
+                with self.assertLogs('qqbot.agent', level='WARNING') as logs:
+                    segments = await self.deliver(message(index + 1, group_id=30, mentioned=True))
+                self.assertEqual(segments, [{'type': 'text', 'data': {'text': '刚刚没能答上来，能再问我一次吗？'}}])
+                self.assertIn('finish_reason=stop', logs.output[0])
+                self.assertIn('response_id=empty-response', logs.output[0])
+        self.assertEqual(self.completion.await_count, 6)
 
+    async def test_empty_response_retries_same_context_before_sending(self):
+        self.completion.side_effect = [response(), response('这次接上啦。')]
+        with self.assertLogs('qqbot.agent', level='WARNING'):
+            segments = await self.deliver(message(group_id=30, mentioned=True))
+        self.assertEqual(segments, [{'type': 'text', 'data': {'text': '这次接上啦。'}}])
+        self.assertEqual(self.completion.await_count, 2)
+        self.assertEqual(self.completion.await_args_list[0].kwargs['messages'], self.completion.await_args_list[1].kwargs['messages'])
+        self.assertEqual(self.replies(), ['这次接上啦。'])
 
+    async def test_empty_response_after_tool_keeps_result_without_reexecuting_tool(self):
+        tool_call = SimpleNamespace(id='call-1', function=SimpleNamespace(name='calculator', arguments='{"expression":"2+3"}'))
+        self.completion.side_effect = [response(calls=[tool_call]), response(), response('答案是 5')]
+        with patch.object(self.agent.tool_registry, 'execute', wraps=self.agent.tool_registry.execute) as execute, self.assertLogs('qqbot.agent', level='WARNING'):
+            await self.deliver(message())
+        execute.assert_awaited_once()
+        self.assertEqual(self.completion.await_args_list[1].kwargs['messages'], self.completion.await_args_list[2].kwargs['messages'])
+        self.assertEqual(self.replies(), ['答案是 5'])
 
     async def test_model_can_quote_current_message_after_tool_call_without_storing_marker(self):
         tool_call = SimpleNamespace(id="call-1", function=SimpleNamespace(

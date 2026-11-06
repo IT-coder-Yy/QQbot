@@ -22,6 +22,16 @@ GROUP_REPLY_INSTRUCTIONS = f"""【群聊引用回复】
 这是最终回复的发送指令，工具调用照常进行；不要向群友解释标记，也不要为了引用重复抄写用户原话。"""
 
 
+def extract_final_answer(text: str) -> str:
+    """兼容带 think 前缀或省略起始标签的回答，跳过代码中的同名标签。"""
+    text = text.strip()
+    start = None
+    for match in re.finditer(r"```.*?```|~~~.*?~~~|`[^`\n]*`|(?P<end></think>)", text, re.S):
+        if match.group("end"):
+            start = match.end()
+    if start is not None:
+        text = text[start:].strip()
+    return "" if text.startswith("<think>") else text
 
 
 def parse_reply(text: str, *, current_message_id: int | None, quote_ids: set[int]) -> list[tuple[str, int | None]]:

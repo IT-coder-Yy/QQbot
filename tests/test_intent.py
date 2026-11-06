@@ -6,14 +6,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
-from qqbot.chat_context import build_intent_state, direct_reply_decision
+from qqbot.chat_context import build_intent_state, direct_reply_decision, message_metadata
 from qqbot.agent import Agent
 from qqbot.context import ContextManager, InMemoryContextStore
 from qqbot.context.sqlite_store import SQLiteContextStore
 from qqbot.dispatcher import MessageJob
 from qqbot.intent import IntentDetector, should_respond
 from qqbot.listen import handle_message
-from qqbot.schema import ContextRole, MentionContent, ReplyContent, TextContent
+from qqbot.schema import ContextAttachment, ContextRole, MentionContent, ReplyContent, TextContent
 from scripts.evaluate_intent import make_case
 from tests.helpers import message
 
@@ -56,6 +56,17 @@ class IntentStateTests(unittest.TestCase):
         self.assertTrue(state['current_message']['text_truncated'])
         self.assertEqual(len(turn.content),10000)
 
+    def test_picture_is_visible_to_intent_in_current_and_followup_turns(self):
+        session, turn, incoming = make_case({'current': '', 'history': [['assistant', 10, '发来看看']]})
+        turn.attachments = [ContextAttachment(type='image', id='picture', name='图片', url='https://example.invalid/private')]
+        state = build_intent_state(session=session, current_turn=turn, message=incoming)
+        expected = [{'type': 'image', 'id': 'picture', 'name': '图片'}]
+        self.assertEqual(state['current_message']['attachments'], expected)
+        followup = turn.model_copy(update={'id': 'followup', 'source_message_id': 1001,
+                                           'content': '这图片有什么', 'attachments': []})
+        state = build_intent_state(session=session, current_turn=followup)
+        self.assertEqual(state['recent_messages'][-1]['attachments'], expected)
+        self.assertEqual(state['current_message']['attachments'], [])
 
     def test_explicit_other_recipient_overrides_quote_bot(self):
         session,turn,incoming=make_case({'current':'你看到了吗','history':[['assistant',10,'周六集合']],'reply_to':1,'mentions':[21]})

@@ -63,6 +63,15 @@ class ApproxTokenCounter:
         total = 0
 
         for message in messages:
+            if isinstance(message, dict) and isinstance(message.get("content"), list):
+                # 图片预处理限制为 2048×2048；保守估计视觉 token，绝不计入 Base64 字符串。
+                content = []
+                for part in message["content"]:
+                    if isinstance(part, dict) and part.get("type") == "image_url":
+                        total += 8192
+                    else:
+                        content.append(part)
+                message = {**message, "content": content}
             serialized = json.dumps(
                 message,
                 ensure_ascii=False,

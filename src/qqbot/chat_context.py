@@ -28,6 +28,7 @@ def render_message(message: ContextMessage, *, now: datetime, max_chars: int = 1
         "seconds_ago": max(0, int((now - message.timestamp).total_seconds())),
         "text": message.content[:max_chars],
         "text_truncated": len(message.content) > max_chars,
+        "attachments": [{"id": item.id, "type": item.type, "name": item.name} for item in message.attachments],
         "mentioned_ids": message.metadata.get("mentioned_ids", []),
         "mentioned_all": message.metadata.get("mentioned_all", False),
         "reply_to_message_id": message.metadata.get("reply_to_message_id"),

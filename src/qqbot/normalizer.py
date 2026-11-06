@@ -6,6 +6,8 @@ from zoneinfo import ZoneInfo
 
 from .schema import (
     Content,
+    AudioContent,
+    FileContent,
     ConversationType,
     DomainEvent,
     FileInfo,
@@ -185,6 +187,19 @@ def _normalize_content(segments: list[dict[str, Any]]) -> tuple[list[Content], l
 
             continue
 
+        if segment_type == "record":
+            content.append(AudioContent(file=data.get("file"), url=data.get("url")))
+            continue
+
+        if segment_type == "file":
+            content.append(FileContent(
+                file_id=str(data.get("file_id") or data.get("file") or data.get("id") or ""),
+                name=str(data.get("name") or "文件"),
+                size=data.get("file_size", data.get("size")),
+                url=data.get("url"), busid=data.get("busid"),
+            ))
+            continue
+
         unhandled_segments.append(segment)
 
     return content, unhandled_segments
@@ -264,6 +279,7 @@ def _normalize_file_upload(event: dict[str, Any]) -> FileUploaded:
         name=str(raw_file["name"]),
         size=raw_file.get("size"),
         busid=raw_file.get("busid"),
+        url=raw_file.get("url"),
     )
 
     return FileUploaded(

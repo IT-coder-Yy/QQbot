@@ -238,7 +238,8 @@ class ContextCompactor:
         else:
             speaker = message.sender_name or str(message.sender_id or "unknown")
 
-        return f"[{timestamp}] [{speaker}] {message.content}"
+        attachments = " ".join(f"[附件 {item.id}: {item.name or item.type}]" for item in message.attachments)
+        return f"[{timestamp}] [{speaker}] {message.content} {attachments}"
 
     @staticmethod
     def _parse_json(

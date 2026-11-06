@@ -8,6 +8,7 @@ import sys
 from contextlib import AsyncExitStack, aclosing
 from datetime import datetime, timezone
 from pathlib import Path
+from contextlib import nullcontext
 
 import websockets
 from dotenv import load_dotenv
@@ -17,14 +18,15 @@ from websockets.exceptions import ConnectionClosed
 
 from .agent import Agent
 from .context import ContextBuilder, ContextManager
-from .context.sqlite_store import SQLiteContextStore
+from .context.sqlite_store import SQLiteContextStore, StorageError
+from .media import MediaService
 from .dispatcher import MessageDispatcher, MessageJob
 from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
 from .proactive import ProactiveDecision, next_active_time, run_proactive
 from .reply import SILENT_MARKER, parse_reply
 from .router import RouteDecision, decide_route
-from .schema import ContextRole, ConversationType, MessageReceived, ProactiveEvent
+from .schema import ContextRole, ConversationType, MessageReceived, FileUploaded, MentionContent, ProactiveEvent
 from .settings import Settings
 from .tools import build_default_tool_registry
 from .transport import NapCatTransport
@@ -40,6 +42,7 @@ async def handle_message(
     intent_detector: IntentDetector | None,
     transport: NapCatTransport,
     intent_timeout: float,
+    media: MediaService | None = None,
 ) -> None:
     message = job.message
     autonomous = isinstance(message, ProactiveEvent)
@@ -58,7 +61,14 @@ async def handle_message(
         return
     if not job.proactive and getattr(store, "persistent", False) and store.has_message(message.conversation_id, message.message_id):
         return
+    refs = media.register_message(message) if media and not job.proactive else []
     quoted_media = False
+    if media and route is RouteDecision.REPLY and not job.proactive:
+        known = {ref.id for ref in refs}
+        quoted = media.referenced(message)
+        quoted_media = bool(quoted and message.text and not any(isinstance(p, MentionContent) and p.target_id for p in message.content))
+        refs.extend(ref for ref in quoted if ref.id not in known)
+        message.metadata["attachments"] = [ref.model_dump(mode="json") for ref in refs]
     # 断线时保留任务，且不继续消耗模型额度；外层总期限仍然计时。
     await transport.wait_connected()
     if job.previous_messages:
@@ -72,7 +82,7 @@ async def handle_message(
         logger.info("合并连发 conversation=%s messages=%s", message.conversation_id,
                     [item.message_id for item in (*job.previous_messages, message)])
     # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
-    with context_manager.processing(message, proactive=job.proactive) as (conversation, session, current_turn):
+    with (store.pin([ref.id for ref in refs]) if media else nullcontext()), context_manager.processing(message, proactive=job.proactive) as (conversation, session, current_turn):
         if job.previous_messages:
             current_turn.metadata["batch_message_ids"] = [item.message_id for item in (*job.previous_messages, message)]
         # 引用也可能是在对另一个群友说话，不能仅凭有引用就跳过受话者判断。
@@ -88,6 +98,19 @@ async def handle_message(
         if message.conversation_type is ConversationType.GROUP and current_turn.source_message_id is not None:
             quote_ids.add(current_turn.source_message_id)
         reply = None
+        # 是否接话已经确定；自然接话与 @ 回复使用相同的附件能力。
+        if media and refs:
+            try:
+                prepared = [await media.prepare(message.conversation_id, ref.id) for ref in refs]
+                if not message.text and all(row["kind"] == "document" for row in prepared):
+                    partial = [row for row in prepared if row["status"] != "ready"]
+                    if partial:
+                        has_text = any(p.get("text", "").strip() for row in prepared for p in json.loads(row["parsed_content_json"] or "[]"))
+                        reply = ("已读取部分内容，尚有未完成的识别：" if has_text else "文件已保存，但文字识别尚未完成：") + str(partial[0]["error"])
+                    else:
+                        reply = "已读取，可以继续提问。"
+            except StorageError as exc:
+                reply = str(exc)
         if reply is None:
             reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
         if job.superseded:
@@ -144,7 +167,7 @@ async def cleanup_contexts(context_manager: ContextManager) -> None:
             logger.exception("本轮存储清理失败，将在下次重试")
 
 
-async def receive_events(websocket, transport: NapCatTransport, dispatcher: MessageDispatcher) -> None:
+async def receive_events(websocket, transport: NapCatTransport, dispatcher: MessageDispatcher, media: MediaService | None = None) -> None:
     async for raw in websocket:
         try:
             payload = json.loads(raw)
@@ -155,16 +178,19 @@ async def receive_events(websocket, transport: NapCatTransport, dispatcher: Mess
             event = normalize_event(payload)
             if isinstance(event, MessageReceived):
                 dispatcher.submit(event)
+            elif isinstance(event, FileUploaded) and media:
+                media.register_upload(event)
         except Exception:
             logger.exception("忽略无效的 OneBot 事件")
 
 
-async def serve(settings: Settings, transport: NapCatTransport, dispatcher: MessageDispatcher) -> None:
+async def serve(settings: Settings, transport: NapCatTransport, dispatcher: MessageDispatcher, media: MediaService | None = None) -> None:
     connector = websockets.connect(
         settings.ws_url,
         additional_headers={"Authorization": f"Bearer {settings.token}"},
         open_timeout=settings.action_timeout,
         close_timeout=settings.action_timeout,
+        max_size=settings.attachment_bytes * 4 // 3 + 2_000_000,
         reconnect_delays=lambda: backoff(
             initial_delay=settings.reconnect_delay,
             min_delay=settings.reconnect_delay,
@@ -178,7 +204,7 @@ async def serve(settings: Settings, transport: NapCatTransport, dispatcher: Mess
             started = asyncio.get_running_loop().time()
             logger.info("已连接 NapCat")
             try:
-                await receive_events(websocket, transport, dispatcher)
+                await receive_events(websocket, transport, dispatcher, media)
             except ConnectionClosed:
                 logger.warning("NapCat 连接中断")
             finally:
@@ -206,11 +232,14 @@ async def main() -> None:
         context_manager = ContextManager(store=store, settings=settings)
         transport = NapCatTransport(action_timeout=settings.action_timeout)
         stack.callback(transport.close)
+        media = MediaService(store, transport, settings)
+        stack.push_async_callback(media.close)
         agent = Agent(
             context_manager=context_manager,
             context_builder=ContextBuilder(),
             tool_registry=tool_registry,
             request_timeout=settings.llm_timeout,
+            media=media,
         )
         stack.push_async_callback(agent.client.close)
         intent_detector = None
@@ -233,7 +262,8 @@ async def main() -> None:
                 intent_detector=intent_detector,
                 transport=transport,
                 intent_timeout=settings.intent_timeout,
-                )
+                media=media,
+            )
 
         async def send_notice(message: MessageReceived, text: str) -> None:
             # 故障提示只在当前可发送时尝试一次，不跨重连积压。
@@ -245,7 +275,7 @@ async def main() -> None:
         cleanup_task = asyncio.create_task(cleanup_contexts(context_manager), name="context-cleanup")
         proactive_task = asyncio.create_task(run_proactive(settings, store, transport, dispatcher), name="group-proactive")
         try:
-            await serve(settings, transport, dispatcher)
+            await serve(settings, transport, dispatcher, media)
         finally:
             cleanup_task.cancel()
             proactive_task.cancel()

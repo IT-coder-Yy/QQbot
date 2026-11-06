@@ -12,9 +12,9 @@ class Settings:
     concurrency: int = 4
     conversation_queue_limit: int = 20
     queue_limit: int = 100
-    task_timeout: float = 120.0
+    task_timeout: float = 600.0
     action_timeout: float = 10.0
-    llm_timeout: float = 60.0
+    llm_timeout: float = 300.0
     reply_interval: float = 0.8
     input_debounce_seconds: float = 1.2
     proactive_idle_seconds: float = 900.0
@@ -43,6 +43,9 @@ class Settings:
     conversation_bytes: int = 50_000_000
     attachment_bytes: int = 50_000_000
     media_timeout: float = 900.0
+    media_api_timeout: float = 120.0
+    soffice: str = "soffice"
+    napcat_file_root: str = ""
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -79,8 +82,13 @@ class Settings:
             ("attachment_bytes", "ATTACHMENT_STORAGE_BYTES", int),
             ("context_cleanup_interval", "STORAGE_CLEANUP_INTERVAL", float),
             ("media_timeout", "MEDIA_TASK_TIMEOUT", float),
+            ("media_api_timeout", "MEDIA_API_TIMEOUT", float),
+            ("task_timeout", "CHAT_TASK_TIMEOUT", float),
+            ("llm_timeout", "LLM_REQUEST_TIMEOUT", float),
             ("proactive_refresh_seconds", "CHAT_PROACTIVE_GROUP_REFRESH_SECONDS", float),
             ("proactive_retry_seconds", "CHAT_PROACTIVE_RETRY_SECONDS", float),
+            ("soffice", "LIBREOFFICE_BIN", str),
+            ("napcat_file_root", "NAPCAT_FILE_ROOT", str),
         ):
             raw = os.getenv(env, "").strip()
             if raw:

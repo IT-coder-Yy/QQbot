@@ -5,7 +5,15 @@ from datetime import datetime
 from time import monotonic
 from uuid import uuid4
 
-from qqbot.schema import ContextMessage, ContextRole, Conversation, MessageReceived, ProactiveEvent, Session
+from qqbot.schema import (
+    ContextMessage,
+    ContextAttachment,
+    ContextRole,
+    Conversation,
+    MessageReceived,
+    ProactiveEvent,
+    Session,
+)
 from qqbot.settings import Settings
 from qqbot.chat_context import message_metadata
 
@@ -115,7 +123,8 @@ class ContextManager:
             sender_id=message.sender.id,
             sender_name=message.sender.display_name,
             source_message_id=message.message_id,
-            metadata=message_metadata(message),
+            attachments=[ContextAttachment.model_validate(item) for item in message.metadata.get("attachments", [])],
+            metadata={**message_metadata(message), "parts": message.metadata.get("parts", [])},
         )
 
         self._append_message(session, context_message)

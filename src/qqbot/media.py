@@ -178,13 +178,15 @@ class MediaService:
                 raise StorageError(TOO_LARGE)
             destination.write_bytes(data)
             return
-        url = info.get("url") or info.get("file")
+        # 同机部署已配置共享目录时，使用 QQ 已下载的原件，避免失效的 CDN 链接。
+        url = (info.get("file") if self.settings.napcat_file_root else None) or info.get("url") or info.get("file")
         if not isinstance(url, str):
             raise StorageError("NapCat 未返回可读取的附件内容。")
         if not url.startswith(("https://", "http://")):
             root = self.settings.napcat_file_root
             path = Path(url.removeprefix("file://")).resolve()
-            if not path.is_relative_to(Path(root).resolve()) or not path.is_file():
+            roots = [Path(item).resolve() for item in root.split(os.pathsep) if item]
+            if not any(path.is_relative_to(item) for item in roots) or not path.is_file():
                 raise StorageError("NapCat 只返回了本地路径，请配置共享目录 NAPCAT_FILE_ROOT 或启用文件内容返回。")
             if path.stat().st_size > limit:
                 raise StorageError(TOO_LARGE)

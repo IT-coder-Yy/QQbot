@@ -7,6 +7,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -20,7 +21,7 @@ from openpyxl.chart import BarChart, Reference
 from qqbot import documents
 from qqbot.agent import Agent
 from qqbot.context import ContextBuilder, ContextManager, InMemoryContextStore
-from qqbot.context.sqlite_store import SQLiteContextStore, StorageError
+from qqbot.context.sqlite_store import SQLiteContextStore, StorageError, TOO_LARGE
 from qqbot.context.token_counter import ApproxTokenCounter
 from qqbot.dispatcher import MessageJob
 from qqbot.listen import handle_message
@@ -224,6 +225,25 @@ class MediaTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(StorageError):
             await self.media._copy_payload({'file':str(path)}, self.root / 'out')
 
+    async def test_configured_image_and_emoji_caches_win_over_expired_url(self):
+        roots = [self.root / name for name in ('Pic', 'Emoji')]
+        for directory in roots:
+            directory.mkdir()
+        self.media.settings = replace(self.media.settings, napcat_file_root=os.pathsep.join(map(str, roots)))
+        output = self.root / 'out'
+        for directory in roots:
+            path = directory / 'image'
+            path.write_bytes(b'original-media')
+            await self.media._copy_payload({'file': str(path), 'url': 'https://gchat.qpic.cn/expired'}, output)
+            self.assertEqual(output.read_bytes(), b'original-media')
+        outside = self.root / 'private-data'
+        outside.write_bytes(b'must not read')
+        link = roots[0] / 'link'
+        link.symlink_to(outside)
+        for path in (outside, link):
+            with self.assertRaises(StorageError):
+                await self.media._copy_payload({'file': str(path)}, output)
+        self.assertEqual(output.read_bytes(), b'original-media')
 
     async def test_ntqq_image_host_is_allowed_but_redirects_still_checked(self):
         requests = []

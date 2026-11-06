@@ -14,6 +14,8 @@ class Settings:
     task_timeout: float = 120.0
     action_timeout: float = 10.0
     llm_timeout: float = 60.0
+    input_debounce_seconds: float = 1.2
+    proactive_idle_seconds: float = 900.0
     intent_timeout: float = 10.0
     dedup_ttl: float = 600.0
     dedup_capacity: int = 10_000
@@ -33,6 +35,7 @@ class Settings:
     data_dir: str = "data"
     conversation_bytes: int = 50_000_000
     attachment_bytes: int = 50_000_000
+    media_timeout: float = 900.0
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -44,11 +47,24 @@ class Settings:
         if not ws_url.startswith(("ws://", "wss://")):
             raise ValueError("NAPCAT_WS_URL 必须使用 ws:// 或 wss://")
         values = dict(ws_url=ws_url, token=token)
+        for field, env in (('input_debounce_seconds', 'CHAT_INPUT_DEBOUNCE_SECONDS'), ('proactive_idle_seconds', 'CHAT_PROACTIVE_IDLE_SECONDS')):
+            raw = os.getenv(env, "").strip()
+            if raw:
+                value = float(raw)
+                if not math.isfinite(value) or value < 0:
+                    raise ValueError(f"{env} 必须是有限非负数")
+                values[field] = value
+        if os.getenv("BOT_NAMES", "").strip():
+            names = tuple(name.strip() for name in os.environ["BOT_NAMES"].replace("，", ",").split(",") if name.strip())
+            if not names:
+                raise ValueError("BOT_NAMES 至少包含一个称呼")
+            values["bot_names"] = names
         for field, env, cast in (
             ("data_dir", "BOT_DATA_DIR", str),
             ("conversation_bytes", "CONVERSATION_STORAGE_BYTES", int),
             ("attachment_bytes", "ATTACHMENT_STORAGE_BYTES", int),
             ("context_cleanup_interval", "STORAGE_CLEANUP_INTERVAL", float),
+            ("media_timeout", "MEDIA_TASK_TIMEOUT", float),
         ):
             raw = os.getenv(env, "").strip()
             if raw:

@@ -5,7 +5,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .router import RouteDecision, decide_route
-from .schema import MessageReceived
+from .schema import ConversationType, MessageReceived
+from .schema import AudioContent, FileContent, ImageContent, TextContent, MentionContent
 from .settings import Settings
 from .transport import DeliveryError
 
@@ -17,6 +18,9 @@ class MessageJob:
     message: MessageReceived
     deadline: float
     reply_started: bool = False
+    proactive: bool = False
+    previous_messages: tuple[MessageReceived, ...] = ()
+    superseded: bool = False
 
 
 class MessageDispatcher:
@@ -34,6 +38,8 @@ class MessageDispatcher:
         self._slots = asyncio.Semaphore(settings.concurrency)
         self._queues: dict[str, deque[MessageJob]] = {}
         self._workers: dict[str, asyncio.Task] = {}
+        self._activity: dict[str, asyncio.Event] = {}
+        self._running: dict[str, MessageJob] = {}
         self._notifications: set[asyncio.Task] = set()
         self._seen: OrderedDict[tuple[str, int], float] = OrderedDict()
         self._inflight: set[tuple[str, int]] = set()
@@ -50,10 +56,20 @@ class MessageDispatcher:
             self._seen.popitem(last=False)
         if key in self._seen or key in self._inflight:
             return False
+        if message.conversation_id in self._activity:
+            self._activity[message.conversation_id].set()
         # shortcut: 去重仅在进程内生效；跨重启恢复时改为持久化状态。
         self._seen[key] = now
         if len(self._seen) > self.settings.dedup_capacity:
             self._seen.popitem(last=False)
+        logger.info(
+            "[收到][%s:%s] %s(%s)：%s",
+            "群" if message.group_id is not None else "私聊",
+            message.group_id if message.group_id is not None else message.sender.id,
+            message.sender.display_name,
+            message.sender.id,
+            message.text or "[非文本消息]",
+        )
         queue = self._queues.get(message.conversation_id)
         if self._waiting >= self.settings.queue_limit or (queue is not None and len(queue) >= self.settings.conversation_queue_limit):
             logger.warning("队列已满 conversation=%s message=%s", *key)
@@ -61,49 +77,95 @@ class MessageDispatcher:
             return False
         if queue is None:
             queue = self._queues[message.conversation_id] = deque()
-        queue.append(MessageJob(message, now + self.settings.task_timeout))
+            self._activity[message.conversation_id] = asyncio.Event()
+        media_turn = message.reply_to_message_id is not None or any(isinstance(p, (AudioContent, FileContent, ImageContent)) for p in message.content)
+        queue.append(MessageJob(message, now + (self.settings.media_timeout if media_turn else self.settings.task_timeout)))
         self._waiting += 1
         self._inflight.add(key)
+        running = self._running.get(message.conversation_id)
+        if (self.settings.input_debounce_seconds > 0 and running and not running.proactive and not running.reply_started
+                and self._can_merge(running.message, message)
+                and all(self._can_merge(running.message, item.message) for item in queue)):
+            running.superseded = True
         if message.conversation_id not in self._workers:
             self._workers[message.conversation_id] = asyncio.create_task(self._work(message.conversation_id))
         return True
 
+    @staticmethod
+    def _can_merge(first: MessageReceived, second: MessageReceived) -> bool:
+        return (isinstance(first, MessageReceived) and isinstance(second, MessageReceived)
+                and first.sender.id == second.sender.id and bool(first.text and second.text)
+                and all(isinstance(part, (TextContent, MentionContent))
+                        and (not isinstance(part, MentionContent) or part.target_id == item.bot_id)
+                        for item in (first, second) for part in item.content))
+
+
     async def _work(self, conversation_id: str) -> None:
         queue = self._queues[conversation_id]
+        activity = self._activity[conversation_id]
+        followup = None
         try:
             while queue:
-                job = queue[0]
+                queued = bool(queue)
+                if queue:
+                    job = queue[0]
+                    followup = None
                 taken = False
+                source_id = job.message.message_id if isinstance(job.message, MessageReceived) else "proactive"
                 try:
                     async with asyncio.timeout_at(job.deadline):
+                        if queued and self.settings.input_debounce_seconds > 0 and self._can_merge(job.message, job.message):
+                            while all(self._can_merge(job.message, item.message) for item in queue):
+                                activity.clear()
+                                try:
+                                    await asyncio.wait_for(activity.wait(), self.settings.input_debounce_seconds)
+                                except TimeoutError:
+                                    break
                         async with self._slots:
                             if asyncio.get_running_loop().time() >= job.deadline:
                                 raise TimeoutError
-                            queue.popleft()
-                            self._waiting -= 1
-                            taken = True
+                            if queued:
+                                queue.popleft()
+                                self._waiting -= 1
+                                taken = True
+                                while (self.settings.input_debounce_seconds > 0 and queue
+                                       and self._can_merge(job.message, queue[0].message)):
+                                    following = queue.popleft()
+                                    job.previous_messages += (job.message,) + following.previous_messages
+                                    job.message = following.message
+                                    self._waiting -= 1
+                                source_id = job.message.message_id if isinstance(job.message, MessageReceived) else "proactive"
+                            self._running[conversation_id] = job
                             await self.handler(job)
                 except DeliveryError as exc:
-                    logger.warning("发送未确认 conversation=%s message=%s: %s", conversation_id, job.message.message_id, exc)
+                    logger.warning("发送未确认 conversation=%s message=%s: %s", conversation_id, source_id, exc)
                 except TimeoutError:
-                    logger.warning("任务到期 conversation=%s message=%s reply_started=%s", conversation_id, job.message.message_id, job.reply_started)
-                    if not job.reply_started:
+                    logger.warning("任务到期 conversation=%s message=%s reply_started=%s", conversation_id, source_id, job.reply_started)
+                    if not job.proactive and not job.reply_started:
                         self._notify(job.message, "这次等待超时了，请稍后再试。")
                 except Exception:
-                    logger.exception("处理失败 conversation=%s message=%s", conversation_id, job.message.message_id)
-                    if not job.reply_started:
+                    logger.exception("处理失败 conversation=%s message=%s", conversation_id, source_id)
+                    if not job.proactive and not job.reply_started:
                         self._notify(job.message, "这次处理失败了，请稍后再试。")
                 finally:
-                    if not taken:
+                    self._running.pop(conversation_id, None)
+                    if job.superseded and queue and self._can_merge(job.message, queue[0].message):
+                        queue[0].previous_messages = job.previous_messages + (job.message,) + queue[0].previous_messages
+                    if queued and not taken:
                         queue.popleft()
                         self._waiting -= 1
-                    self._inflight.discard((conversation_id, job.message.message_id))
+                    if not job.proactive:
+                        for item in (*job.previous_messages, job.message):
+                            self._inflight.discard((conversation_id, item.message_id))
         finally:
             self._waiting -= len(queue)
             for job in queue:
-                self._inflight.discard((conversation_id, job.message.message_id))
+                if not job.proactive:
+                    self._inflight.discard((conversation_id, job.message.message_id))
             self._queues.pop(conversation_id, None)
             self._workers.pop(conversation_id, None)
+            self._activity.pop(conversation_id, None)
+
 
     def _notify(self, message: MessageReceived, text: str) -> None:
         if self._closed or decide_route(message) is not RouteDecision.REPLY:
@@ -138,6 +200,8 @@ class MessageDispatcher:
         # 刚创建且尚未运行的任务不会进入 finally。
         self._workers.clear()
         self._queues.clear()
+        self._activity.clear()
+        self._running.clear()
         self._notifications.clear()
         self._inflight.clear()
         self._waiting = 0

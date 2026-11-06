@@ -1,7 +1,9 @@
 import asyncio
 import json
+import tempfile
 import unittest
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -11,6 +13,7 @@ from websockets.exceptions import InvalidStatus
 from websockets.http11 import Response
 
 from qqbot.context import ContextManager, InMemoryContextStore
+from qqbot.context.sqlite_store import SQLiteContextStore
 from qqbot.dispatcher import MessageDispatcher, MessageJob
 from qqbot.listen import handle_message, receive_events, serve
 from qqbot.schema import ContextRole
@@ -21,7 +24,7 @@ from tests.helpers import FakeSocket, eventually, message, raw_message, success
 
 class PipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        self.settings = replace(Settings(), task_timeout=1, action_timeout=0.2)
+        self.settings = replace(Settings(), task_timeout=1, action_timeout=0.2, proactive_idle_seconds=0, input_debounce_seconds=0)
         self.manager = ContextManager(InMemoryContextStore())
         self.agent = SimpleNamespace(run=AsyncMock(return_value="答案"))
         self.intent = None
@@ -58,6 +61,82 @@ class PipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.history()[-1].source_message_id, 501)
         self.agent.run.assert_awaited_once()
         self.assertEqual(len(self.ws.sent), 1)
+
+    async def test_burst_uses_one_model_turn_and_keeps_each_original_message(self):
+        self.dispatcher.settings = replace(self.settings, input_debounce_seconds=.02)
+        for i, text in enumerate(['周末想出去走走', '预算两百', '最好离市区近点'], 1):
+            event = raw_message(i, group_id=30, mentioned=i == 1)
+            event['message'][0]['data']['text'] = text
+            await self.feed(event)
+        await eventually(lambda: self.ws.sent)
+        self.agent.run.assert_awaited_once()
+        args = self.agent.run.await_args.kwargs
+        self.assertEqual(args['current_turn'].metadata['batch_message_ids'], [1, 2, 3])
+        self.assertEqual([entry.content for entry in self.history()], ['周末想出去走走', '预算两百', '最好离市区近点'])
+        await self.feed(success(self.ws.sent[0], 501))
+        await eventually(lambda: not self.dispatcher._workers)
+        self.assertEqual([entry.source_message_id for entry in self.history()], [1, 2, 3, 501])
+        self.assertEqual(len(self.ws.sent), 1)
+
+    async def test_followup_during_generation_suppresses_old_draft_and_keeps_context(self):
+        self.dispatcher.settings = replace(self.settings, input_debounce_seconds=.02)
+        started, release = asyncio.Event(), asyncio.Event()
+        count = 0
+        async def generate(**kwargs):
+            nonlocal count
+            count += 1
+            if count == 1:
+                started.set()
+                await release.wait()
+                return '旧草稿'
+            self.assertEqual(kwargs['current_turn'].metadata['batch_message_ids'], [1, 2, 3])
+            return '合起来回答'
+        self.agent.run.side_effect = generate
+        await self.feed(raw_message(1, group_id=30, mentioned=True))
+        await eventually(started.is_set)
+        await self.feed(raw_message(2, group_id=30))
+        await self.feed(raw_message(3, group_id=30))
+        await eventually(lambda: self.dispatcher._waiting == 2)
+        release.set()
+        await eventually(lambda: self.ws.sent)
+        self.assertEqual(self.ws.sent[0]['params']['message'], [{'type':'text','data':{'text':'合起来回答'}}])
+        self.assertEqual([entry.source_message_id for entry in self.history()], [1, 2, 3])
+        await self.feed(success(self.ws.sent[0], 501))
+        await eventually(lambda: not self.dispatcher._workers)
+        self.assertEqual(len(self.ws.sent), 1)
+        self.assertEqual(self.agent.run.await_count, 2)
+        self.assertFalse(self.dispatcher._running)
+
+    async def test_followup_after_send_starts_does_not_replace_sent_reply(self):
+        self.dispatcher.settings = replace(self.settings, input_debounce_seconds=.02)
+        self.agent.run.side_effect = ['已发出的回复', '接着回答']
+        await self.feed(raw_message(1))
+        await eventually(lambda: self.ws.sent)
+        await self.feed(raw_message(2))
+        await eventually(lambda: self.dispatcher._waiting == 1)
+        await self.feed(success(self.ws.sent[0], 501))
+        await eventually(lambda: len(self.ws.sent) == 2)
+        self.assertEqual(self.agent.run.await_args.kwargs['current_turn'].metadata.get('batch_message_ids'), None)
+        await self.feed(success(self.ws.sent[1], 502))
+        await eventually(lambda: not self.dispatcher._workers)
+        self.assertEqual([entry.content for entry in self.history() if entry.role is ContextRole.ASSISTANT], ['已发出的回复', '接着回答'])
+
+    async def test_persistent_followup_keeps_originals_once_after_restart(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder)
+            store = SQLiteContextStore(path / 'bot.db', path / 'files')
+            self.manager = ContextManager(store)
+            try:
+                # processing 结束会释放内存缓存，检查持久化内容而不是 sessions。
+                self.history = lambda: [SimpleNamespace(**entry) for entry in store.history(message(group_id=30).conversation_id)]
+                await self.test_followup_during_generation_suppresses_old_draft_and_keeps_context()
+            finally:
+                store.close()
+            restored = SQLiteContextStore(path / 'bot.db', path / 'files')
+            try:
+                self.assertEqual([entry['source_message_id'] for entry in restored.history(message(group_id=30).conversation_id)], [1, 2, 3, 501])
+            finally:
+                restored.close()
 
     async def test_full_queue_does_not_block_acknowledgement(self):
         self.dispatcher.settings = replace(self.settings, queue_limit=1, conversation_queue_limit=1)

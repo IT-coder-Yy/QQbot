@@ -4,12 +4,14 @@ from dataclasses import replace
 from unittest.mock import AsyncMock
 
 from qqbot.dispatcher import MessageDispatcher
+from qqbot.schema import ImageContent
 from qqbot.settings import Settings
 from tests.helpers import eventually, message
 
 
 class DispatcherTests(unittest.IsolatedAsyncioTestCase):
     def create_dispatcher(self, handler, **overrides):
+        overrides.setdefault('input_debounce_seconds', 0)
         notices = AsyncMock()
         dispatcher = MessageDispatcher(replace(Settings(), **overrides), handler, notices)
         self.addAsyncCleanup(dispatcher.close)
@@ -35,6 +37,54 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         gate.set()
         await eventually(lambda: not dispatcher._workers)
         self.assertEqual(finished, [3, 1, 2])
+        self.assertEqual(dispatcher._waiting, 0)
+
+    async def test_consecutive_texts_merge_without_crossing_other_speakers(self):
+        jobs = []
+        async def handle(job):
+            jobs.append(job)
+        dispatcher, _ = self.create_dispatcher(handle, input_debounce_seconds=.02)
+        for incoming in [message(1, group_id=30), message(2, group_id=30),
+                         message(3, user_id=21, group_id=30), message(4, group_id=30)]:
+            dispatcher.submit(incoming)
+        await eventually(lambda: not dispatcher._workers)
+        self.assertEqual([job.message.message_id for job in jobs], [2, 3, 4])
+        self.assertEqual([[m.message_id for m in job.previous_messages] for job in jobs], [[1], [], []])
+        self.assertEqual(dispatcher._waiting, 0)
+        self.assertFalse(dispatcher._inflight)
+
+    async def test_text_debounce_does_not_hold_a_slot_or_merge_images(self):
+        seen = []
+        async def handle(job):
+            seen.append(job.message.message_id)
+            self.assertFalse(job.previous_messages)
+        dispatcher, _ = self.create_dispatcher(handle, input_debounce_seconds=.05, concurrency=1)
+        dispatcher.submit(message(1, group_id=30))
+        picture = message(2, group_id=31)
+        picture.content = [ImageContent(file='synthetic.png')]
+        dispatcher.submit(picture)
+        await eventually(lambda: seen)
+        self.assertEqual(seen, [2])
+        same_group_picture = picture.model_copy(update={'conversation_id':message(group_id=30).conversation_id, 'group_id':30, 'message_id':3})
+        dispatcher.submit(same_group_picture)
+        await eventually(lambda: not dispatcher._workers)
+        self.assertEqual(seen, [2, 1, 3])
+
+    async def test_debounce_deadline_and_close_leave_no_queued_ids(self):
+        handler = AsyncMock()
+        dispatcher, notices = self.create_dispatcher(handler, input_debounce_seconds=.2, task_timeout=.01)
+        dispatcher.submit(message(1))
+        dispatcher.submit(message(2))
+        await eventually(lambda: not dispatcher._workers)
+        handler.assert_not_awaited()
+        self.assertFalse(dispatcher._inflight)
+        self.assertEqual(dispatcher._waiting, 0)
+        dispatcher.settings = replace(dispatcher.settings, task_timeout=1)
+        dispatcher.submit(message(3))
+        await asyncio.sleep(0)
+        await dispatcher.close()
+        self.assertFalse(dispatcher._running)
+        self.assertFalse(dispatcher._inflight)
         self.assertEqual(dispatcher._waiting, 0)
 
     async def test_concurrency_and_queue_limits_reject_new_work(self):

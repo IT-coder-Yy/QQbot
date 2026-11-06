@@ -20,7 +20,7 @@ from .dispatcher import MessageDispatcher, MessageJob
 from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
 from .router import RouteDecision, decide_route
-from .schema import ConversationType, MessageReceived
+from .schema import ContextRole, ConversationType, MessageReceived
 from .settings import Settings
 from .tools import build_default_tool_registry
 from .transport import NapCatTransport
@@ -48,16 +48,30 @@ async def handle_message(
     quoted_media = False
     # 断线时保留任务，且不继续消耗模型额度；外层总期限仍然计时。
     await transport.wait_connected()
+    if job.previous_messages:
+        _, session = context_manager.get_or_create_context(message)
+        known_ids = {item.source_message_id for item in session.recent_messages if item.role is ContextRole.USER}
+        for previous in job.previous_messages:
+            if (store.has_message(previous.conversation_id, previous.message_id) if getattr(store, "persistent", False)
+                    else previous.message_id in known_ids):
+                continue
+            context_manager.record_user_message(previous)
+        logger.info("合并连发 conversation=%s messages=%s", message.conversation_id,
+                    [item.message_id for item in (*job.previous_messages, message)])
     # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
     with context_manager.processing(message) as (conversation, session, current_turn):
+        if job.previous_messages:
+            current_turn.metadata["batch_message_ids"] = [item.message_id for item in (*job.previous_messages, message)]
         # 引用也可能是在对另一个群友说话，不能仅凭有引用就跳过受话者判断。
-        if message.conversation_type is ConversationType.GROUP and not any(item.mentioned_bot for item in (message,)) and not quoted_media:
+        if message.conversation_type is ConversationType.GROUP and not any(item.mentioned_bot for item in (*job.previous_messages, message)) and not quoted_media:
             if not await should_respond(message=message, session=session, current_turn=current_turn,
                                         detector=intent_detector, agent=agent, timeout=intent_timeout,
                                         fallback_timeout=context_manager.settings.intent_fallback_timeout, store=store):
                 return
 
         reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
+        if job.superseded:
+            return
         if not reply.strip():
             raise RuntimeError("模型返回了空白回复")
         if asyncio.get_running_loop().time() >= job.deadline:

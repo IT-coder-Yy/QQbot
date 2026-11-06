@@ -20,6 +20,7 @@ from .agent import Agent
 from .context import ContextBuilder, ContextManager
 from .context.sqlite_store import SQLiteContextStore, StorageError
 from .media import MediaService
+from .outbound import OutboundTurn, PreparedAction
 from .dispatcher import MessageDispatcher, MessageJob
 from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
@@ -82,7 +83,7 @@ async def handle_message(
         logger.info("合并连发 conversation=%s messages=%s", message.conversation_id,
                     [item.message_id for item in (*job.previous_messages, message)])
     # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
-    with (store.pin([ref.id for ref in refs]) if media else nullcontext()), context_manager.processing(message, proactive=job.proactive) as (conversation, session, current_turn):
+    with (store.pin([ref.id for ref in refs]) if media else nullcontext()), context_manager.processing(message, proactive=job.proactive) as (conversation, session, current_turn), (OutboundTurn(media, message.conversation_id) if media else nullcontext()) as outbound:
         if job.previous_messages:
             current_turn.metadata["batch_message_ids"] = [item.message_id for item in (*job.previous_messages, message)]
         # 引用也可能是在对另一个群友说话，不能仅凭有引用就跳过受话者判断。
@@ -112,7 +113,8 @@ async def handle_message(
             except StorageError as exc:
                 reply = str(exc)
         if reply is None:
-            reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
+            reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn,
+                                    **({"outbound": outbound} if outbound else {}))
         if job.superseded:
             return
         if autonomous:
@@ -125,6 +127,8 @@ async def handle_message(
         if job.proactive and reply.strip() == SILENT_MARKER:
             return
         replies = parse_reply(reply, current_message_id=None if autonomous else message.message_id, quote_ids=quote_ids)
+        if outbound:
+            replies = outbound.expand(replies)
         if not replies:
             raise RuntimeError("模型返回了空白回复")
         for index, (reply, quote_id) in enumerate(replies):
@@ -144,7 +148,12 @@ async def handle_message(
                 raise TimeoutError
             # 每条独立确认并入库；中途失败时保留已经送达的部分。
             job.reply_started = True
-            if autonomous:
+            attachments = []
+            if isinstance(reply, PreparedAction):
+                segments, reply, attachments = await outbound.materialize(reply, deadline=job.deadline)
+                message_id = await transport.send_segments(message, segments, reply_to_message_id=quote_id,
+                                                          deadline=job.deadline, timeout=settings.media_api_timeout)
+            elif autonomous:
                 message_id = await transport.send_group_text(message.group_id, reply, reply_to_message_id=quote_id, deadline=job.deadline)
             else:
                 message_id = await transport.reply_text(message, reply, reply_to_message_id=quote_id, deadline=job.deadline)
@@ -153,6 +162,7 @@ async def handle_message(
                 timestamp=datetime.now(tz=message.timestamp.tzinfo), source_message_id=message_id,
                 reply_to_message_id=quote_id,
                 proactive=job.proactive,
+                attachments=attachments,
             )
         if autonomous:
             store.schedule_proactive(message.conversation_id, next_active_time(decision.next_check_at, settings))

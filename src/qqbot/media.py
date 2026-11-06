@@ -131,6 +131,9 @@ class MediaService:
             return []
         refs = {row["id"]: self.reference(row) for row in self.store.attachments(message.conversation_id)
                 if row["source_message_id"] == message.reply_to_message_id}
+        for item in self.store.history(message.conversation_id):
+            if item["source_message_id"] == message.reply_to_message_id:
+                refs.update((ref["id"], ContextAttachment.model_validate(ref)) for ref in item["attachments"])
         return list(refs.values())
 
     async def _request(self, action, params):

@@ -54,6 +54,23 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await task, -123)
         self.assertEqual(len(self.ws.sent), 2)
 
+    async def test_media_targets_quote_and_upload_timeout(self):
+        for target in (message(), message(group_id=30)):
+            count = len(self.ws.sent)
+            segments = [{"type": "image", "data": {"file": "base64://R0lG", "sub_type": 1}},
+                        {"type": "face", "data": {"id": "76"}}]
+            task = asyncio.create_task(self.transport.send_segments(target, segments, reply_to_message_id=-7, timeout=1))
+            await eventually(lambda: len(self.ws.sent) > count)
+            # 超过普通动作的等待时间，上传仍然可以收到成功回执。
+            await asyncio.sleep(0.12)
+            self.assertFalse(task.done())
+            payload = self.ws.sent[-1]
+            self.assertEqual(payload["params"]["message"][1:], segments)
+            self.assertEqual(payload["params"]["message"][0]["data"]["id"], "-7")
+            self.assertEqual(payload["params"]["message_type"], target.conversation_type.value)
+            self.assertEqual(payload["params"].get("group_id") or payload["params"].get("user_id"), target.group_id or target.sender.id)
+            self.transport.handle_response(success(payload))
+            self.assertEqual(await task, 101)
 
     async def test_concurrent_sends_match_out_of_order_responses(self):
         first = await self.start_send()

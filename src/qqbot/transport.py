@@ -7,7 +7,7 @@ from typing import Any
 
 from websockets.exceptions import ConnectionClosed
 
-from .schema import ConversationType, MessageReceived
+from .schema import ConversationType, MessageReceived, ProactiveEvent
 
 logger = logging.getLogger(__name__)
 
@@ -140,6 +140,17 @@ class NapCatTransport:
 
         raise ValueError(f"不支持的会话类型: {message.conversation_type}")
 
+    async def send_segments(self, target: MessageReceived | ProactiveEvent, segments: list[dict[str, Any]], *,
+                            reply_to_message_id: int | None = None, deadline: float | None = None,
+                            timeout: float | None = None) -> int:
+        message = ([{"type": "reply", "data": {"id": str(reply_to_message_id)}}]
+                   if reply_to_message_id is not None else []) + segments
+        params = {"message_type": target.conversation_type.value, "message": message}
+        if target.conversation_type is ConversationType.GROUP:
+            params["group_id"] = target.group_id
+        else:
+            params["user_id"] = target.sender.id
+        return await self._send_action("send_msg", params, deadline=deadline, timeout=timeout)
 
     async def _send_action(self, action: str, params: dict[str, Any], *, deadline: float | None = None,
                            timeout: float | None = None) -> int:

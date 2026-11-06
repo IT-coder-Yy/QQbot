@@ -20,8 +20,11 @@ class Settings:
     notice_cooldown: float = 30.0
     reconnect_delay: float = 1.0
     reconnect_max_delay: float = 30.0
-    intent_threshold: float = 0.75
+    # 合成会话实测结果见 docs/evals；切换 JEV 模型或提示词后需重新评估。
+    intent_threshold: float = 0.5
     intent_recent_limit: int = 12
+    intent_fallback_timeout: float = 20.0
+    bot_names: tuple[str, ...] = ("糖糖", "村头洋哥")
     context_max_messages: int = 200
     context_max_chars: int = 64_000
     context_max_conversations: int = 256

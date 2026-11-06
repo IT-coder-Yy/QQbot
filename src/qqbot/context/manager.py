@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from qqbot.schema import ContextMessage, ContextRole, Conversation, MessageReceived, Session
 from qqbot.settings import Settings
+from qqbot.chat_context import message_metadata
 
 from .store import InMemoryContextStore
 
@@ -103,6 +104,7 @@ class ContextManager:
             sender_id=message.sender.id,
             sender_name=message.sender.display_name,
             source_message_id=message.message_id,
+            metadata=message_metadata(message),
         )
 
         self._append_message(session, context_message)

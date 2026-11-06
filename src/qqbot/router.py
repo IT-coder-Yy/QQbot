@@ -34,7 +34,7 @@ def decide_route(
     if message.conversation_type is ConversationType.GROUP:
         # 群聊明确 @Bot：
         # 不需要浪费一次 Jev 调用。
-        if message.mentioned_bot:
+        if message.mentioned_bot or (message.reply_to_message_id is not None and message.text):
             return RouteDecision.REPLY
 
         # 没有 @：

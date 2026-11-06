@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+import sys
 from contextlib import AsyncExitStack, aclosing
 from datetime import datetime
 
@@ -16,7 +17,7 @@ from websockets.exceptions import ConnectionClosed
 from .agent import Agent
 from .context import ContextBuilder, ContextManager, InMemoryContextStore
 from .dispatcher import MessageDispatcher, MessageJob
-from .intent import IntentDetector
+from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
 from .router import RouteDecision, decide_route
 from .schema import ConversationType, MessageReceived
@@ -40,20 +41,20 @@ async def handle_message(
     route = decide_route(message)
     if route is RouteDecision.IGNORE:
         return
+    store = context_manager.store
+    settings = context_manager.settings
+    if getattr(store, "persistent", False) and store.has_message(message.conversation_id, message.message_id):
+        return
+    quoted_media = False
     # 断线时保留任务，且不继续消耗模型额度；外层总期限仍然计时。
     await transport.wait_connected()
     # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
     with context_manager.processing(message) as (conversation, session, current_turn):
-        if route is RouteDecision.INTENT:
-            if intent_detector is None:
-                return
-            try:
-                async with asyncio.timeout(intent_timeout):
-                    intent = await intent_detector.detect(session=session, current_turn=current_turn)
-            except Exception:
-                logger.exception("意图判断失败，保持沉默 conversation=%s message=%s", message.conversation_id, message.message_id)
-                return
-            if not intent.should_reply:
+        # 引用也可能是在对另一个群友说话，不能仅凭有引用就跳过受话者判断。
+        if message.conversation_type is ConversationType.GROUP and not any(item.mentioned_bot for item in (message,)) and not quoted_media:
+            if not await should_respond(message=message, session=session, current_turn=current_turn,
+                                        detector=intent_detector, agent=agent, timeout=intent_timeout,
+                                        fallback_timeout=context_manager.settings.intent_fallback_timeout, store=store):
                 return
 
         reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
@@ -61,27 +62,19 @@ async def handle_message(
             raise RuntimeError("模型返回了空白回复")
         if asyncio.get_running_loop().time() >= job.deadline:
             raise TimeoutError
-        # 从这里开始超时不能再补发“失败”提示：原回复可能已经送达。
         job.reply_started = True
-        message_id = await transport.reply_text(
-            message,
-            reply,
-            quote=message.conversation_type is ConversationType.GROUP,
-            deadline=job.deadline,
-        )
-        context_manager.record_assistant_message(
-            conversation=conversation,
-            session=session,
-            content=reply,
-            timestamp=datetime.now(tz=message.timestamp.tzinfo),
-            source_message_id=message_id,
-        )
+        message_id = await transport.reply_text(message, reply, deadline=job.deadline)
+        context_manager.record_assistant_message(conversation=conversation, session=session, content=reply,
+            timestamp=datetime.now(tz=message.timestamp.tzinfo), source_message_id=message_id)
 
 
 async def cleanup_contexts(context_manager: ContextManager) -> None:
     while True:
         await asyncio.sleep(context_manager.settings.context_cleanup_interval)
-        context_manager.cleanup_expired()
+        try:
+            context_manager.cleanup_expired()
+        except Exception:
+            logger.exception("本轮存储清理失败，将在下次重试")
 
 
 async def receive_events(websocket, transport: NapCatTransport, dispatcher: MessageDispatcher) -> None:
@@ -133,13 +126,15 @@ async def serve(settings: Settings, transport: NapCatTransport, dispatcher: Mess
 
 async def main() -> None:
     load_dotenv()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", stream=sys.stdout)
     settings = Settings.from_env()
-    context_manager = ContextManager(store=InMemoryContextStore(), settings=settings)
     tool_registry = build_default_tool_registry()
     logger.info("已加载工具: %s", ", ".join(tool_registry.names))
 
     async with AsyncExitStack() as stack:
+        context_manager = ContextManager(InMemoryContextStore(), settings=settings)
+        transport = NapCatTransport(action_timeout=settings.action_timeout)
+        stack.callback(transport.close)
         agent = Agent(
             context_manager=context_manager,
             context_builder=ContextBuilder(),
@@ -154,12 +149,10 @@ async def main() -> None:
                 client=jev_client,
                 reply_threshold=settings.intent_threshold,
                 recent_message_limit=settings.intent_recent_limit,
+                bot_names=settings.bot_names,
             )
         else:
-            logger.info("TYPESAFE_API_KEY 未配置，仅响应私聊和 @Bot")
-
-        transport = NapCatTransport(action_timeout=settings.action_timeout)
-        stack.callback(transport.close)
+            logger.info("TYPESAFE_API_KEY 未配置，仅响应私聊、@Bot 及明确引用机器人的消息")
 
         async def process(job: MessageJob) -> None:
             await handle_message(
@@ -169,12 +162,12 @@ async def main() -> None:
                 intent_detector=intent_detector,
                 transport=transport,
                 intent_timeout=settings.intent_timeout,
-            )
+                )
 
         async def send_notice(message: MessageReceived, text: str) -> None:
             # 故障提示只在当前可发送时尝试一次，不跨重连积压。
             if transport.connected:
-                await transport.reply_text(message, text, quote=message.conversation_type is ConversationType.GROUP)
+                await transport.reply_text(message, text)
 
         dispatcher = MessageDispatcher(settings, process, send_notice)
         stack.push_async_callback(dispatcher.close)

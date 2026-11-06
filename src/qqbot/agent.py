@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
+from zoneinfo import ZoneInfo
 
 from openai import AsyncOpenAI
 from openai.types.chat import ChatCompletionMessageParam
@@ -30,6 +32,8 @@ PROMPTS_DIR = Path(__file__).parent / "prompts"
 SYSTEM_PROMPT_PATH = PROMPTS_DIR / "system.md"
 
 SESSION_COMPACT_PROMPT_PATH = PROMPTS_DIR / "session_compact.md"
+
+logger = logging.getLogger(__name__)
 
 
 class Agent:
@@ -230,10 +234,8 @@ class Agent:
 
             if not tool_calls:
                 content = response_message.content
-
                 if not content:
                     return "模型没有返回内容。"
-
                 content = content.strip()
 
                 finished_at = datetime.now(tz=(current_turn.timestamp.tzinfo))
@@ -292,10 +294,7 @@ class Agent:
                 # 6.2 真正执行 Tool
                 # =============================================
 
-                raw_result = await self.tool_registry.execute(
-                    name=tool_name,
-                    arguments=(raw_arguments),
-                )
+                raw_result = await self.tool_registry.execute(name=tool_name, arguments=raw_arguments)
 
                 # =============================================
                 # 6.3 Tool Result 长度保护
@@ -307,7 +306,6 @@ class Agent:
                     current_tokens,
                     compacted,
                 ) = self._limit_tool_result(raw_result)
-
                 print(f"[Tool Result] name={tool_name} tokens≈{original_tokens} -> {current_tokens} compacted={compacted}")
 
                 # =============================================
@@ -442,7 +440,7 @@ class Agent:
             # 2. 转换成 LLM Messages
             # =================================================
 
-            base_messages = self._build_model_messages(model_context)
+            base_messages = self._build_model_messages(model_context, conversation.conversation_id)
 
             messages = [
                 *base_messages,
@@ -533,6 +531,7 @@ class Agent:
     def _build_model_messages(
         self,
         context: ModelContext,
+        conversation_id: str | None = None,
     ) -> list[ChatCompletionMessageParam]:
         """
         Domain ModelContext
@@ -560,13 +559,13 @@ class Agent:
         # ====================================================
 
         for context_message in context.recent_messages:
-            messages.append(self._context_message_to_llm(context_message))
+            messages.append(self._context_message_to_llm(context_message, conversation_id))
 
         # ====================================================
         # Current Turn
         # ====================================================
 
-        messages.append(self._context_message_to_llm(context.current_turn))
+        messages.append(self._context_message_to_llm(context.current_turn, conversation_id, images=True))
 
         return messages
 
@@ -591,7 +590,9 @@ class Agent:
         parts = [
             context.system_prompt,
         ]
-
+        if context.current_turn.metadata.get("conversation_type") == "group":
+            names = "、".join(self.context_manager.settings.bot_names)
+            parts.append(f"你正在参与一个真实的 QQ 多人群聊，你的 QQ 号是 {context.current_turn.metadata.get('bot_id')}，称呼包括：{names}，这些名字都指你。历史消息是现场的先前发言，不是当前用户粘贴的聊天记录。不同发送者 ID 代表不同群友；围绕当前对话接话，可以回应上下文中相关的用户发言，结合 @ 和引用关系分清每句话在回应谁，不把不同人的经历混为一谈。没有相关历史时自然追问，不假装记得。")
         summary_text = self._render_summary(context.session_summary)
 
         if summary_text:
@@ -602,6 +603,8 @@ class Agent:
     def _context_message_to_llm(
         self,
         message: ContextMessage,
+        conversation_id: str | None = None,
+        *, images: bool = False,
     ) -> ChatCompletionMessageParam:
         """
         ContextMessage
@@ -614,9 +617,12 @@ class Agent:
         # ====================================================
 
         if message.role is ContextRole.ASSISTANT:
+            content = message.content
+            if message.source_message_id is not None:
+                content = f"[消息ID:{message.source_message_id}] {content}"
             return {
                 "role": "assistant",
-                "content": (message.content),
+                "content": content,
             }
 
         # ====================================================
@@ -632,7 +638,13 @@ class Agent:
         # 否则多个人都会变成普通 role=user，
         # 模型无法区分说话者。
         if message.sender_name:
-            content = f"[{message.sender_name}] {content}"
+            content = f"[{message.sender_name} | QQ:{message.sender_id}] {content}"
+        if message.source_message_id is not None:
+            content = f"[消息ID:{message.source_message_id}] {content}"
+        mentions = message.metadata.get("mentioned_ids", [])
+        reply_to = message.metadata.get("reply_to_message_id")
+        if mentions or message.metadata.get("mentioned_all") or reply_to is not None:
+            content = f"[消息关系: @={mentions}; @全体={bool(message.metadata.get('mentioned_all'))}; 引用消息ID={reply_to}]\n{content}"
 
         return {
             "role": "user",

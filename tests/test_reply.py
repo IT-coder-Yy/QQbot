@@ -14,13 +14,14 @@ from qqbot.context import ContextBuilder, ContextManager, InMemoryContextStore
 from qqbot.context.sqlite_store import SQLiteContextStore
 from qqbot.dispatcher import MessageJob
 from qqbot.listen import handle_message
-from qqbot.reply import MESSAGE_BREAK, QUOTE_MARKER
+from qqbot.normalizer import normalize_event
+from qqbot.reply import MESSAGE_BREAK, QUOTE_MARKER, SILENT_MARKER, extract_final_answer
 from qqbot.schema import ContextRole, ReplyContent
 from qqbot.settings import Settings
 from qqbot.tools import ToolRegistry
 from qqbot.tools.calculator import CalculatorTool
 from qqbot.transport import DeliveryError, NapCatTransport
-from tests.helpers import FakeSocket, eventually, message, success
+from tests.helpers import FakeSocket, eventually, message, raw_message, success
 
 
 def response(content=None, calls=None):
@@ -148,7 +149,22 @@ class ReplyPolicyTests(unittest.IsolatedAsyncioTestCase):
         await self.deliver(message())
         self.assertEqual(self.replies(), [answer])
 
+    def test_thinking_wrapper_preserves_autonomous_json_and_silent_marker(self):
+        for final in ('{"reply":"嘿嘿","next_check_at":"2026-10-28T20:00:00+08:00","reason":"接话"}', SILENT_MARKER):
+            with self.subTest(final=final):
+                self.assertEqual(extract_final_answer('内部分析占位\n</think>\n' + final), final)
 
+    async def test_native_face_and_unicode_emoji_reach_model_and_history(self):
+        event = raw_message(group_id=30, mentioned=True)
+        event['message'][0]['data']['text'] = '😂👨‍👩‍👧‍👦👍🏽'
+        event['message'].insert(1, {'type': 'face', 'data': {'id': '20', 'raw': {'faceText': '/偷笑'}}})
+        self.completion.return_value = response('又笑我')
+        await self.deliver(normalize_event(event))
+        expected = '😂👨‍👩‍👧‍👦👍🏽[QQ表情：/偷笑]'
+        request = self.completion.await_args.kwargs['messages']
+        self.assertIn(expected, request[-1]['content'])
+        session = next(iter(self.manager.store.sessions.values()))
+        self.assertEqual(session.recent_messages[0].content, expected)
 
     async def test_group_plain_answer_does_not_quote_despite_history_mention_and_incoming_quote(self):
         for index in range(1, 6):
@@ -313,3 +329,46 @@ class ReplyPolicyTests(unittest.IsolatedAsyncioTestCase):
                 await task
         self.assertEqual(len(self.ws.sent), 2)
         self.assertEqual(self.replies(), ['第一句。'])
+
+    async def test_proactive_turn_uses_system_event_without_duplicate_user_history(self):
+        root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        store = SQLiteContextStore(root / 'bot.db', root / 'attachments')
+        self.addCleanup(store.close)
+        self.manager = ContextManager(store, settings=replace(Settings(), reply_interval=0))
+        self.agent.context_manager = self.manager
+        incoming = message(group_id=30, mentioned=True)
+        self.completion.return_value = response('好呀。')
+        await self.deliver(incoming)
+        self.completion.return_value = response(f'突然想聊聊电影。{MESSAGE_BREAK}最近有想看的片子吗？')
+        await self.deliver(incoming, proactive=True)
+        history = store.history(incoming.conversation_id)
+        self.assertEqual(len([entry for entry in history if entry['role'] == 'user']), 1)
+        self.assertEqual([entry['content'] for entry in history if entry['role'] == 'assistant'], ['好呀。', '突然想聊聊电影。', '最近有想看的片子吗？'])
+        request = self.completion.await_args.kwargs['messages']
+        self.assertEqual(request[-1]['role'], 'system')
+        self.assertIn('不是用户新发来的消息', request[-1]['content'])
+        self.assertFalse(any('本轮只回应当前用户输入' in item['content'] for item in request))
+
+    async def test_proactive_model_can_remain_silent_and_offline_skips_model(self):
+        incoming = message()
+        self.manager.record_user_message(incoming)
+        self.completion.return_value = response(SILENT_MARKER)
+        await self.deliver(incoming, proactive=True)
+        self.assertFalse(self.ws.sent)
+        self.assertEqual(self.replies(), [])
+        self.transport.detach(self.ws)
+        await self.handle(incoming, proactive=True)
+        self.completion.assert_awaited_once()
+
+    async def test_disconnect_during_proactive_generation_does_not_queue_a_send(self):
+        incoming = message()
+        self.manager.record_user_message(incoming)
+
+        async def generate(**kwargs):
+            self.transport.detach(self.ws)
+            return response('想聊聊电影。')
+
+        self.completion.side_effect = generate
+        await self.deliver(incoming, proactive=True)
+        self.assertFalse(self.ws.sent)
+        self.assertEqual(self.replies(), [])

@@ -146,6 +146,13 @@ def _normalize_content(segments: list[dict[str, Any]]) -> tuple[list[Content], l
 
             continue
 
+        if segment_type == "face":
+            # NapCat 接收的原生表情名称在 raw.faceText，沿用文本链路保留顺序与历史。
+            raw = data.get("raw")
+            name = raw.get("faceText") if isinstance(raw, dict) else None
+            content.append(TextContent(text=f"[QQ表情：{name}]" if name else f"[QQ表情 ID:{data.get('id', '未知')}，名称未知]"))
+            continue
+
         if segment_type == "at":
             qq = data.get("qq")
 

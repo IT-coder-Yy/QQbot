@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+import httpx
 from PIL import Image
 from edge_tts.exceptions import NoAudioReceived
 
@@ -26,7 +27,7 @@ from qqbot.reply import MESSAGE_BREAK, parse_reply
 from qqbot.schema import ImageContent, ReplyContent, TextContent
 from qqbot.settings import Settings
 from qqbot.tools import ToolRegistry
-from qqbot.transport import DeliveryUnknownError, NapCatTransport
+from qqbot.transport import DeliveryError, DeliveryUnknownError, NapCatTransport
 from tests.helpers import FakeSocket, eventually, message, success
 
 
@@ -139,9 +140,69 @@ class OutboundTests(unittest.IsolatedAsyncioTestCase):
             result, _ = await turn.execute("prepare_face", '{"name":"不存在的表情"}')
             self.assertIn("error", json.loads(result))
 
+    async def test_favorite_search_downloads_only_selected_and_can_share_account_favorites(self):
+        self.transport.request.return_value = [self.favorite()]
+        with OutboundTurn(self.media, self.incoming.conversation_id) as turn:
+            data, _ = await self.prepare(turn, "find_favorite_stickers", query="哈哈")
+            identifier = data["items"][0]["attachment_id"]
+            self.assertEqual(data["fetched_count"], 1)
+            self.assertIn("不保证已取全", data["note"])
+            self.assertIsNone(self.store.attachment(self.incoming.conversation_id, identifier)["local_path"])
+            await self.media.client.aclose()
+            self.media.client = httpx.AsyncClient(transport=httpx.MockTransport(lambda r: httpx.Response(200, content=self.gif)))
+            self.addAsyncCleanup(self.media.client.aclose)
+            await self.prepare(turn, "prepare_image", attachment_id=identifier, as_sticker=True)
+        cid = message(user_id=21).conversation_id
+        with OutboundTurn(self.media, cid) as other:
+            data, _ = await self.prepare(other, "find_favorite_stickers")
+            shared_id = data["items"][0]["attachment_id"]
+            self.assertNotEqual(shared_id, identifier)
+            self.assertIsNotNone(self.store.attachment(cid, shared_id))
 
+    async def test_collect_is_deferred_and_verified_before_success(self):
+        identifier = await self.register()
+        with OutboundTurn(self.media, self.incoming.conversation_id) as turn:
+            _, action = await self.prepare(turn, "collect_sticker", attachment_id=identifier, description="开心")
+            self.transport.request.assert_not_awaited()
+            self.transport.request.side_effect = [[], {"file": "/napcat/tmp/face"}, None, [self.favorite()], None]
+            segments, content, _ = await turn.materialize(action, deadline=asyncio.get_running_loop().time()+10)
+            self.assertEqual(content, "这个表情已经收藏了")
+            self.assertEqual(segments[0]["data"]["text"], content)
+            calls = self.transport.request.await_args_list
+            self.assertEqual([c.args[0] for c in calls], ["fetch_custom_face_detail", "download_file", "add_custom_face", "fetch_custom_face_detail", "set_custom_face_desc"])
+            self.assertEqual(base64.b64decode(calls[1].args[1]["base64"]), self.gif)
+            self.assertEqual(calls[2].args[1], {"file": "/napcat/tmp/face"})
+            self.assertEqual(calls[4].args[1]["emoji_id"], 17)
 
+    async def test_collect_duplicate_unknown_failure_and_missing_readback(self):
+        identifier = await self.register()
+        cases = [([ [self.favorite()] ], "已经在收藏里", 0),
+                 ([[], {"file": "/tmp/a"}, DeliveryUnknownError("断线")], "无法确认", 1),
+                 ([[], {"file": "/tmp/a"}, DeliveryError("拒绝")], "拒绝", 1),
+                 ([[], {"file": "/tmp/a"}, None, []], "还没确认", 1),
+                 ([[], {"file": "/tmp/a"}, None, DeliveryError("回读失败")], "无法回读确认", 1),
+                 ([[], {"file": "/tmp/a"}, None, [self.favorite()], DeliveryError("描述失败")], "已确认收藏", 1)]
+        with OutboundTurn(self.media, self.incoming.conversation_id) as turn:
+            _, action = await self.prepare(turn, "collect_sticker", attachment_id=identifier, description="开心")
+            for responses, expected, adds in cases:
+                self.transport.request.reset_mock(side_effect=True)
+                self.transport.request.side_effect = responses
+                _, content, _ = await turn.materialize(action, deadline=asyncio.get_running_loop().time()+10)
+                self.assertIn(expected, content)
+                self.assertEqual(sum(c.args[0] == "add_custom_face" for c in self.transport.request.await_args_list), adds)
 
+    async def test_superseded_reply_does_not_send_or_collect(self):
+        identifier = await self.register()
+        job = MessageJob(self.incoming, asyncio.get_running_loop().time()+10)
+        async def generate(**kwargs):
+            data, _ = await self.prepare(kwargs["outbound"], "collect_sticker", attachment_id=identifier, description="开心")
+            job.superseded = True
+            return data["marker"]
+        await handle_message(job, context_manager=self.manager, agent=SimpleNamespace(run=generate), intent_detector=None,
+                             transport=self.transport, intent_timeout=1, media=self.media)
+        self.transport.request.assert_not_awaited()
+        self.transport.send_segments.assert_not_awaited()
+        self.assertFalse(self.store.protected_attachments)
 
     async def test_real_agent_tool_loop_sends_image_voice_and_face_and_keeps_history(self):
         identifier = await self.register()

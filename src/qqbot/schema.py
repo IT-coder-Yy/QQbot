@@ -28,6 +28,8 @@ class ConversationType(str, Enum):
     GROUP = "group"
 
 
+
+
 class SenderRole(str, Enum):
     OWNER = "owner"
     ADMIN = "admin"
@@ -107,8 +109,23 @@ class ReplyContent(SchemaModel):
     message_id: int
 
 
+class AudioContent(SchemaModel):
+    type: Literal["audio"] = "audio"
+    file: str | None = None
+    url: str | None = None
+
+
+class FileContent(SchemaModel):
+    type: Literal["file"] = "file"
+    file_id: str
+    name: str
+    size: int | None = None
+    url: str | None = None
+    busid: int | None = None
+
+
 Content: TypeAlias = Annotated[
-    TextContent | MentionContent | ImageContent | ReplyContent,
+    TextContent | MentionContent | ImageContent | ReplyContent | AudioContent | FileContent,
     Field(discriminator="type"),
 ]
 
@@ -229,7 +246,7 @@ DomainEvent: TypeAlias = Annotated[
 
 
 class ContextAttachment(SchemaModel):
-    type: Literal["image", "file"]
+    type: Literal["image", "file", "audio"]
     id: str | None = None
     name: str | None = None
     url: str | None = None
@@ -240,6 +257,7 @@ class ContextMessage(SchemaModel):
     """Context Store 内部保存的统一消息。"""
 
     id: str
+    seq: int = 0
     role: ContextRole
     content: str
     timestamp: datetime
@@ -300,6 +318,7 @@ class Session(SchemaModel):
     updated_at: datetime
     closed_at: datetime | None = None
     summary: SessionSummary = Field(default_factory=SessionSummary)
+    summary_through_seq: int = 0
     recent_messages: list[ContextMessage] = Field(default_factory=list)
 
 

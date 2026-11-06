@@ -106,6 +106,7 @@ class ContextCompactor:
         new_summary.updated_at = datetime.now(tz=session.updated_at.tzinfo)
 
         session.summary = new_summary
+        session.summary_through_seq = max(session.summary_through_seq, *(message.seq for message in batch))
 
         return True
 

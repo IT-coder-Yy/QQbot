@@ -5,13 +5,7 @@ from datetime import datetime
 from time import monotonic
 from uuid import uuid4
 
-from qqbot.schema import (
-    ContextMessage,
-    ContextRole,
-    Conversation,
-    MessageReceived,
-    Session,
-)
+from qqbot.schema import ContextMessage, ContextRole, Conversation, MessageReceived, Session
 from qqbot.settings import Settings
 
 from .store import InMemoryContextStore
@@ -25,18 +19,25 @@ class ContextManager:
             raise ValueError("上下文容量和清理间隔必须大于 0")
         self._last_used: OrderedDict[str, float] = OrderedDict()
         self._active: set[str] = set()
+        if getattr(store, "persistent", False):
+            store.protected = self._active
 
     @contextmanager
     def processing(self, message: MessageReceived) -> Iterator[tuple[Conversation, Session, ContextMessage]]:
-        context = self.record_user_message(message)
         self._active.add(message.conversation_id)
         try:
+            context = self.record_user_message(message)
             yield context
         finally:
             self._active.remove(message.conversation_id)
             self._touch(message.conversation_id)
+            if getattr(self.store, "persistent", False):
+                self.store.release(message.conversation_id)
 
     def cleanup_expired(self) -> None:
+        if getattr(self.store, "persistent", False):
+            self.store.cleanup()
+            return
         now = monotonic()
         for conversation_id, last_used in list(self._last_used.items()):
             if now - last_used < self.settings.context_idle_timeout:
@@ -45,6 +46,8 @@ class ContextManager:
                 self._delete_context(conversation_id)
 
     def _touch(self, conversation_id: str) -> None:
+        if getattr(self.store, "persistent", False):
+            return
         self._last_used[conversation_id] = monotonic()
         self._last_used.move_to_end(conversation_id)
 
@@ -53,11 +56,12 @@ class ContextManager:
         del self._last_used[conversation_id]
 
     def get_or_create_context(self, message: MessageReceived) -> tuple[Conversation, Session]:
-        self.cleanup_expired()
+        if not getattr(self.store, "persistent", False):
+            self.cleanup_expired()
         conversation = self.store.get_conversation(message.conversation_id)
 
         if conversation is None:
-            if len(self.store.conversations) >= self.settings.context_max_conversations:
+            if not getattr(self.store, "persistent", False) and len(self.store.conversations) >= self.settings.context_max_conversations:
                 oldest_idle = next((key for key in self._last_used if key not in self._active), None)
                 if oldest_idle is None:
                     raise RuntimeError("上下文容量已满，所有会话都在处理中")
@@ -141,7 +145,7 @@ class ContextManager:
 
     def _append_message(self, session: Session, message: ContextMessage) -> None:
         # 超长消息仍完整传给本轮 Agent/Jev，但不长期保留，也不清空已有历史。
-        if self._message_chars(message) <= self.settings.context_max_chars:
+        if getattr(self.store, "persistent", False) or self._message_chars(message) <= self.settings.context_max_chars:
             session.recent_messages.append(message)
 
     def save_session(self, session: Session) -> None:
@@ -150,6 +154,9 @@ class ContextManager:
         通过 ContextManager 写回 Store。
         """
 
+        if getattr(self.store, "persistent", False):
+            self.store.save_session(session)
+            return
         chars = 0
         keep = 0
         for message in reversed(session.recent_messages[-self.settings.context_max_messages :]):
@@ -162,7 +169,7 @@ class ContextManager:
 
     def _create_session(self, *, conversation: Conversation, timestamp: datetime) -> Session:
         session = Session(
-            session_id=uuid4().hex,
+            session_id=conversation.conversation_id if getattr(self.store, "persistent", False) else uuid4().hex,
             conversation_id=conversation.conversation_id,
             created_at=timestamp,
             updated_at=timestamp,

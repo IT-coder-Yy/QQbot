@@ -20,6 +20,9 @@ htmlcov/
 # Logs and local databases
 *.log
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+data/
 
 # Virtual environments
 .venv/

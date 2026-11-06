@@ -1,4 +1,5 @@
 import os
+import math
 from dataclasses import dataclass
 
 
@@ -6,7 +7,7 @@ from dataclasses import dataclass
 class Settings:
     ws_url: str = "ws://127.0.0.1:3001"
     token: str = ""
-    # 运行策略在代码中调整，不读取环境变量；时间单位为秒。
+    # 时间单位为秒；存储、多模态超时等可通过 from_env 中列出的配置调整。
     concurrency: int = 4
     conversation_queue_limit: int = 20
     queue_limit: int = 100
@@ -26,6 +27,9 @@ class Settings:
     context_max_conversations: int = 256
     context_idle_timeout: float = 24 * 60 * 60
     context_cleanup_interval: float = 60.0
+    data_dir: str = "data"
+    conversation_bytes: int = 50_000_000
+    attachment_bytes: int = 50_000_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,4 +40,17 @@ class Settings:
         ws_url = os.getenv("NAPCAT_WS_URL", defaults.ws_url).strip()
         if not ws_url.startswith(("ws://", "wss://")):
             raise ValueError("NAPCAT_WS_URL 必须使用 ws:// 或 wss://")
-        return cls(ws_url=ws_url, token=token)
+        values = dict(ws_url=ws_url, token=token)
+        for field, env, cast in (
+            ("data_dir", "BOT_DATA_DIR", str),
+            ("conversation_bytes", "CONVERSATION_STORAGE_BYTES", int),
+            ("attachment_bytes", "ATTACHMENT_STORAGE_BYTES", int),
+            ("context_cleanup_interval", "STORAGE_CLEANUP_INTERVAL", float),
+        ):
+            raw = os.getenv(env, "").strip()
+            if raw:
+                value = cast(raw)
+                if cast is not str and (not math.isfinite(value) or value <= 0):
+                    raise ValueError(f"{env} 必须是有限正数")
+                values[field] = value
+        return cls(**values)

@@ -1,6 +1,7 @@
 import os
 import math
 from dataclasses import dataclass
+from zoneinfo import ZoneInfo
 
 
 @dataclass(frozen=True)
@@ -17,6 +18,11 @@ class Settings:
     reply_interval: float = 0.8
     input_debounce_seconds: float = 1.2
     proactive_idle_seconds: float = 900.0
+    proactive_timezone: str = "Asia/Shanghai"
+    proactive_start_hour: int = 10
+    proactive_end_hour: int = 23
+    proactive_refresh_seconds: float = 300.0
+    proactive_retry_seconds: float = 900.0
     intent_timeout: float = 10.0
     dedup_ttl: float = 600.0
     dedup_capacity: int = 10_000
@@ -48,6 +54,13 @@ class Settings:
         if not ws_url.startswith(("ws://", "wss://")):
             raise ValueError("NAPCAT_WS_URL 必须使用 ws:// 或 wss://")
         values = dict(ws_url=ws_url, token=token)
+        zone = os.getenv("CHAT_PROACTIVE_TIMEZONE", defaults.proactive_timezone).strip()
+        ZoneInfo(zone)
+        start = int(os.getenv("CHAT_PROACTIVE_START_HOUR", str(defaults.proactive_start_hour)))
+        end = int(os.getenv("CHAT_PROACTIVE_END_HOUR", str(defaults.proactive_end_hour)))
+        if not 0 <= start < end <= 24:
+            raise ValueError("主动聊天时段必须满足 0 <= 开始小时 < 结束小时 <= 24")
+        values.update(proactive_timezone=zone, proactive_start_hour=start, proactive_end_hour=end)
         for field, env in (('reply_interval', 'CHAT_REPLY_INTERVAL'), ('input_debounce_seconds', 'CHAT_INPUT_DEBOUNCE_SECONDS'), ('proactive_idle_seconds', 'CHAT_PROACTIVE_IDLE_SECONDS')):
             raw = os.getenv(env, "").strip()
             if raw:
@@ -66,6 +79,8 @@ class Settings:
             ("attachment_bytes", "ATTACHMENT_STORAGE_BYTES", int),
             ("context_cleanup_interval", "STORAGE_CLEANUP_INTERVAL", float),
             ("media_timeout", "MEDIA_TASK_TIMEOUT", float),
+            ("proactive_refresh_seconds", "CHAT_PROACTIVE_GROUP_REFRESH_SECONDS", float),
+            ("proactive_retry_seconds", "CHAT_PROACTIVE_RETRY_SECONDS", float),
         ):
             raw = os.getenv(env, "").strip()
             if raw:

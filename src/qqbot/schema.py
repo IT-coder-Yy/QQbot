@@ -28,6 +28,17 @@ class ConversationType(str, Enum):
     GROUP = "group"
 
 
+class ProactiveEvent(SchemaModel):
+    """程序发起的群聊机会，没有用户、QQ 消息 ID 或用户正文。"""
+
+    bot_id: int
+    group_id: int
+    timestamp: datetime
+    conversation_type: Literal[ConversationType.GROUP] = ConversationType.GROUP
+
+    @property
+    def conversation_id(self) -> str:
+        return f"qq:group:{self.bot_id}:{self.group_id}"
 
 
 class SenderRole(str, Enum):

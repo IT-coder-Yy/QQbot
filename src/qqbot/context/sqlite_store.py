@@ -50,7 +50,7 @@ class SQLiteContextStore(InMemoryContextStore):
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
         version = self.db.execute("PRAGMA user_version").fetchone()[0]
-        if version not in (0, 1):
+        if version not in (0, 1, 2):
             self.db.close()
             raise RuntimeError(f"不支持的数据库版本: {version}")
         self.db.executescript('''
@@ -88,7 +88,10 @@ class SQLiteContextStore(InMemoryContextStore):
             CREATE INDEX IF NOT EXISTS attachments_conversation ON attachments(conversation_id, created_at);
             CREATE INDEX IF NOT EXISTS attachments_cleanup ON attachments(last_used_at, created_at, id);
         ''')
-        self.db.execute("PRAGMA user_version=1")
+        if version < 2:
+            with self.db:
+                self.db.execute("ALTER TABLE conversations ADD COLUMN next_proactive_at INTEGER")
+                self.db.execute("PRAGMA user_version=2")
         # tmp 只用于本服务转换；启动时不存在需要恢复的执行任务。
         shutil.rmtree(self.files / "tmp", ignore_errors=True)
         self.cleanup()
@@ -142,7 +145,19 @@ class SQLiteContextStore(InMemoryContextStore):
         return any(m.get("source_message_id") == message_id and m["role"] == "user"
                    for m in self.history(conversation_id))
 
+    def next_proactive_time(self, conversation_id):
+        row = self.db.execute("SELECT next_proactive_at FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        return datetime.fromtimestamp(row[0] / 1000, timezone.utc) if row and row[0] is not None else None
 
+    def schedule_proactive(self, conversation_id, when):
+        old = self.db.execute("SELECT * FROM conversations WHERE id=?", (conversation_id,)).fetchone()
+        now = int(time.time() * 1000)
+        row = dict(old) if old else dict(id=conversation_id, messages_json="[]", summary_json="{}",
+            summary_through_seq=0, next_message_seq=1, created_at=now, last_message_at=now, storage_bytes=0)
+        row["next_proactive_at"] = milliseconds(when)
+        with self.db:
+            self._write_conversation(row)
+            self._clean_conversations(current=conversation_id)
 
     @staticmethod
     def _row_size(row):
@@ -158,7 +173,7 @@ class SQLiteContextStore(InMemoryContextStore):
         old = self.db.execute("SELECT * FROM conversations WHERE id=?", (cid,)).fetchone()
         row = dict(old) if old else dict(id=cid, messages_json="[]", summary_json="{}", summary_through_seq=0,
                                         next_message_seq=1, created_at=milliseconds(session.created_at),
-                                        last_message_at=milliseconds(session.updated_at), storage_bytes=0)
+                                        last_message_at=milliseconds(session.updated_at), storage_bytes=0, next_proactive_at=None)
         archive = {m["id"]: m for m in json.loads(row["messages_json"])}
         for message in session.recent_messages:
             if not message.seq:

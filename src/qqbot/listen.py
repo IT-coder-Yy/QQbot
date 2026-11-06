@@ -6,7 +6,8 @@ import logging
 import os
 import sys
 from contextlib import AsyncExitStack, aclosing
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 
 import websockets
 from dotenv import load_dotenv
@@ -15,13 +16,15 @@ from websockets.client import backoff
 from websockets.exceptions import ConnectionClosed
 
 from .agent import Agent
-from .context import ContextBuilder, ContextManager, InMemoryContextStore
+from .context import ContextBuilder, ContextManager
+from .context.sqlite_store import SQLiteContextStore
 from .dispatcher import MessageDispatcher, MessageJob
 from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
-from .reply import parse_reply
+from .proactive import ProactiveDecision, next_active_time, run_proactive
+from .reply import SILENT_MARKER, parse_reply
 from .router import RouteDecision, decide_route
-from .schema import ContextRole, ConversationType, MessageReceived
+from .schema import ContextRole, ConversationType, MessageReceived, ProactiveEvent
 from .settings import Settings
 from .tools import build_default_tool_registry
 from .transport import NapCatTransport
@@ -39,12 +42,21 @@ async def handle_message(
     intent_timeout: float,
 ) -> None:
     message = job.message
-    route = decide_route(message)
+    autonomous = isinstance(message, ProactiveEvent)
+    route = RouteDecision.REPLY if autonomous else decide_route(message)
     if route is RouteDecision.IGNORE:
         return
     store = context_manager.store
     settings = context_manager.settings
-    if getattr(store, "persistent", False) and store.has_message(message.conversation_id, message.message_id):
+    if autonomous:
+        now = datetime.now(timezone.utc)
+        active_at = next_active_time(now, settings)
+        if active_at > now:
+            store.schedule_proactive(message.conversation_id, active_at)
+            return
+    if job.proactive and not transport.connected:
+        return
+    if not job.proactive and getattr(store, "persistent", False) and store.has_message(message.conversation_id, message.message_id):
         return
     quoted_media = False
     # 断线时保留任务，且不继续消耗模型额度；外层总期限仍然计时。
@@ -60,11 +72,11 @@ async def handle_message(
         logger.info("合并连发 conversation=%s messages=%s", message.conversation_id,
                     [item.message_id for item in (*job.previous_messages, message)])
     # 模型、工具和发送回执等待期间，其他会话不能淘汰正在使用的上下文。
-    with context_manager.processing(message) as (conversation, session, current_turn):
+    with context_manager.processing(message, proactive=job.proactive) as (conversation, session, current_turn):
         if job.previous_messages:
             current_turn.metadata["batch_message_ids"] = [item.message_id for item in (*job.previous_messages, message)]
         # 引用也可能是在对另一个群友说话，不能仅凭有引用就跳过受话者判断。
-        if message.conversation_type is ConversationType.GROUP and not any(item.mentioned_bot for item in (*job.previous_messages, message)) and not quoted_media:
+        if not job.proactive and message.conversation_type is ConversationType.GROUP and not any(item.mentioned_bot for item in (*job.previous_messages, message)) and not quoted_media:
             if not await should_respond(message=message, session=session, current_turn=current_turn,
                                         detector=intent_detector, agent=agent, timeout=intent_timeout,
                                         fallback_timeout=context_manager.settings.intent_fallback_timeout, store=store):
@@ -80,7 +92,16 @@ async def handle_message(
             reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
         if job.superseded:
             return
-        replies = parse_reply(reply, current_message_id=message.message_id, quote_ids=quote_ids)
+        if autonomous:
+            decision = ProactiveDecision.model_validate_json(reply, context={"now": datetime.now(timezone.utc)})
+            logger.info("主动决策 conversation=%s next=%s reason=%s", message.conversation_id, decision.next_check_at, decision.reason)
+            reply = decision.reply
+            if not reply.strip():
+                store.schedule_proactive(message.conversation_id, next_active_time(decision.next_check_at, settings))
+                return
+        if job.proactive and reply.strip() == SILENT_MARKER:
+            return
+        replies = parse_reply(reply, current_message_id=None if autonomous else message.message_id, quote_ids=quote_ids)
         if not replies:
             raise RuntimeError("模型返回了空白回复")
         for index, (reply, quote_id) in enumerate(replies):
@@ -88,16 +109,30 @@ async def handle_message(
                 await asyncio.sleep(context_manager.settings.reply_interval)
             if job.superseded:
                 return
+            if job.proactive and not transport.connected:
+                return
+            if autonomous:
+                now = datetime.now(timezone.utc)
+                active_at = next_active_time(now, settings)
+                if active_at > now:
+                    store.schedule_proactive(message.conversation_id, active_at)
+                    return
             if asyncio.get_running_loop().time() >= job.deadline:
                 raise TimeoutError
             # 每条独立确认并入库；中途失败时保留已经送达的部分。
             job.reply_started = True
-            message_id = await transport.reply_text(message, reply, reply_to_message_id=quote_id, deadline=job.deadline)
+            if autonomous:
+                message_id = await transport.send_group_text(message.group_id, reply, reply_to_message_id=quote_id, deadline=job.deadline)
+            else:
+                message_id = await transport.reply_text(message, reply, reply_to_message_id=quote_id, deadline=job.deadline)
             context_manager.record_assistant_message(
                 conversation=conversation, session=session, content=reply,
                 timestamp=datetime.now(tz=message.timestamp.tzinfo), source_message_id=message_id,
                 reply_to_message_id=quote_id,
+                proactive=job.proactive,
             )
+        if autonomous:
+            store.schedule_proactive(message.conversation_id, next_active_time(decision.next_check_at, settings))
 
 
 async def cleanup_contexts(context_manager: ContextManager) -> None:
@@ -164,7 +199,11 @@ async def main() -> None:
     logger.info("已加载工具: %s", ", ".join(tool_registry.names))
 
     async with AsyncExitStack() as stack:
-        context_manager = ContextManager(InMemoryContextStore(), settings=settings)
+        data_dir = Path(settings.data_dir)
+        store = SQLiteContextStore(data_dir / "qqbot.sqlite3", data_dir / "attachments",
+                                   conversation_bytes=settings.conversation_bytes, attachment_bytes=settings.attachment_bytes)
+        stack.callback(store.close)
+        context_manager = ContextManager(store=store, settings=settings)
         transport = NapCatTransport(action_timeout=settings.action_timeout)
         stack.callback(transport.close)
         agent = Agent(
@@ -204,11 +243,13 @@ async def main() -> None:
         dispatcher = MessageDispatcher(settings, process, send_notice)
         stack.push_async_callback(dispatcher.close)
         cleanup_task = asyncio.create_task(cleanup_contexts(context_manager), name="context-cleanup")
+        proactive_task = asyncio.create_task(run_proactive(settings, store, transport, dispatcher), name="group-proactive")
         try:
             await serve(settings, transport, dispatcher)
         finally:
             cleanup_task.cancel()
-            await asyncio.gather(cleanup_task, return_exceptions=True)
+            proactive_task.cancel()
+            await asyncio.gather(cleanup_task, proactive_task, return_exceptions=True)
 
 
 if __name__ == "__main__":

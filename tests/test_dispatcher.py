@@ -1,10 +1,11 @@
 import asyncio
 import unittest
 from dataclasses import replace
+from datetime import datetime, timezone
 from unittest.mock import AsyncMock
 
 from qqbot.dispatcher import MessageDispatcher
-from qqbot.schema import ImageContent
+from qqbot.schema import ProactiveEvent, ImageContent
 from qqbot.settings import Settings
 from tests.helpers import eventually, message
 
@@ -202,3 +203,150 @@ class DispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(dispatcher.submit(message(user_id=10)))
         handler.assert_not_awaited()
         notices.assert_not_awaited()
+    async def test_idle_triggers_once_without_new_user_event(self):
+        jobs = []
+
+        async def handle(job):
+            jobs.append(job)
+            job.reply_started = True
+
+        dispatcher, notices = self.create_dispatcher(handle, proactive_idle_seconds=.01)
+        dispatcher.submit(message())
+        await eventually(lambda: len(jobs) == 2 and not dispatcher._workers)
+        self.assertEqual([job.proactive for job in jobs], [False, True])
+        self.assertEqual(dispatcher._waiting, 0)
+        self.assertFalse(dispatcher._inflight)
+        self.assertFalse(dispatcher._activity)
+        notices.assert_not_awaited()
+
+    async def test_silent_or_disabled_conversation_never_starts_proactive(self):
+        for enabled in (False, True):
+            with self.subTest(enabled=enabled):
+                async def handle(job):
+                    job.reply_started = not enabled
+                handler = AsyncMock(side_effect=handle)
+                dispatcher, _ = self.create_dispatcher(handler, proactive_idle_seconds=.01 if enabled else 0)
+                dispatcher.submit(message())
+                await eventually(lambda: not dispatcher._workers)
+                handler.assert_awaited_once()
+
+    async def test_new_message_wakes_idle_worker_without_waiting_for_timer(self):
+        jobs = []
+
+        async def handle(job):
+            jobs.append(job)
+            job.reply_started = job.message.message_id == 1
+
+        dispatcher, _ = self.create_dispatcher(handle, proactive_idle_seconds=3600, concurrency=1)
+        dispatcher.submit(message(1))
+        await eventually(lambda: jobs)
+        dispatcher.submit(message(2))
+        await eventually(lambda: len(jobs) == 2 and not dispatcher._workers)
+        self.assertTrue(all(not job.proactive for job in jobs))
+
+    async def test_new_message_cancels_proactive_before_processing_user(self):
+        generating = asyncio.Event()
+        cancelled = asyncio.Event()
+        jobs = []
+
+        async def handle(job):
+            jobs.append(job)
+            if job.proactive:
+                generating.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            elif job.message.message_id == 1:
+                job.reply_started = True
+            else:
+                self.assertTrue(cancelled.is_set())
+
+        dispatcher, notices = self.create_dispatcher(handle, proactive_idle_seconds=.01)
+        dispatcher.submit(message(1))
+        await eventually(generating.is_set)
+        dispatcher.submit(message(2))
+        await eventually(lambda: len(jobs) == 3 and not dispatcher._workers)
+        self.assertEqual([job.proactive for job in jobs], [False, True, False])
+        notices.assert_not_awaited()
+
+    async def test_idle_wait_releases_concurrency_and_close_cancels_timer(self):
+        jobs = []
+
+        async def handle(job):
+            jobs.append(job)
+            job.reply_started = True
+
+        dispatcher, _ = self.create_dispatcher(handle, proactive_idle_seconds=3600, concurrency=1)
+        dispatcher.submit(message(1))
+        await eventually(lambda: len(jobs) == 1)
+        dispatcher.submit(message(2, user_id=21))
+        await eventually(lambda: len(jobs) == 2)
+        await dispatcher.close()
+        self.assertFalse(dispatcher._activity)
+        self.assertFalse(dispatcher._workers)
+
+    async def test_proactive_failure_does_not_send_failure_notice(self):
+        async def handle(job):
+            if job.proactive:
+                raise RuntimeError('模拟主动聊天失败')
+            job.reply_started = True
+
+        dispatcher, notices = self.create_dispatcher(handle, proactive_idle_seconds=.01)
+        dispatcher.submit(message())
+        await eventually(lambda: not dispatcher._workers)
+        notices.assert_not_awaited()
+
+    async def test_group_reply_does_not_add_old_fixed_followup(self):
+        async def handle(job):
+            job.reply_started = True
+        handler = AsyncMock(side_effect=handle)
+        dispatcher, _ = self.create_dispatcher(handler, proactive_idle_seconds=.01)
+        dispatcher.submit(message(group_id=30, mentioned=True))
+        await eventually(lambda: not dispatcher._workers)
+        handler.assert_awaited_once()
+
+    async def test_new_group_event_is_cancelled_before_real_message_and_can_be_scheduled_again(self):
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+        jobs = []
+        async def handle(job):
+            jobs.append(job)
+            if job.proactive:
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            else:
+                self.assertTrue(cancelled.is_set())
+        dispatcher, notices = self.create_dispatcher(handle)
+        event = ProactiveEvent(bot_id=10, group_id=30, timestamp=datetime.now(timezone.utc))
+        self.assertTrue(dispatcher.submit_proactive(event))
+        self.assertFalse(dispatcher.submit_proactive(event))
+        await eventually(started.is_set)
+        dispatcher.submit(message(group_id=30))
+        await eventually(lambda: not dispatcher._workers)
+        self.assertEqual([job.proactive for job in jobs], [True, False])
+        self.assertEqual(dispatcher._waiting, 0)
+        self.assertFalse(dispatcher._inflight)
+        self.assertTrue(dispatcher.submit_proactive(event))
+        notices.assert_not_awaited()
+
+    async def test_proactive_queued_for_slot_yields_to_new_group_message(self):
+        gate = asyncio.Event()
+        jobs = []
+        async def handle(job):
+            jobs.append(job)
+            if job.message.conversation_id.endswith(':31'):
+                await gate.wait()
+        dispatcher, _ = self.create_dispatcher(handle, concurrency=1)
+        dispatcher.submit(message(group_id=31))
+        await eventually(lambda: jobs)
+        dispatcher.submit_proactive(ProactiveEvent(bot_id=10, group_id=30, timestamp=datetime.now(timezone.utc)))
+        dispatcher.submit(message(group_id=30))
+        gate.set()
+        await eventually(lambda: not dispatcher._workers)
+        self.assertTrue(all(not job.proactive for job in jobs))
+        self.assertEqual(len(jobs), 2)
+        self.assertEqual(dispatcher._waiting, 0)

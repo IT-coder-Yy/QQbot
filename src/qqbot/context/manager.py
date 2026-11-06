@@ -5,7 +5,7 @@ from datetime import datetime
 from time import monotonic
 from uuid import uuid4
 
-from qqbot.schema import ContextMessage, ContextRole, Conversation, MessageReceived, Session
+from qqbot.schema import ContextMessage, ContextRole, Conversation, MessageReceived, ProactiveEvent, Session
 from qqbot.settings import Settings
 from qqbot.chat_context import message_metadata
 
@@ -24,10 +24,21 @@ class ContextManager:
             store.protected = self._active
 
     @contextmanager
-    def processing(self, message: MessageReceived) -> Iterator[tuple[Conversation, Session, ContextMessage]]:
+    def processing(self, message: MessageReceived | ProactiveEvent, *, proactive: bool = False) -> Iterator[tuple[Conversation, Session, ContextMessage]]:
         self._active.add(message.conversation_id)
         try:
-            context = self.record_user_message(message)
+            if proactive:
+                conversation, session = self.get_or_create_context(message)
+                # 临时触发上下文由 Agent 渲染成系统消息，不冒充用户发言写入历史。
+                turn = ContextMessage(id=uuid4().hex, role=ContextRole.USER, content="",
+                                      timestamp=datetime.now(tz=message.timestamp.tzinfo),
+                                      metadata={"proactive": True, "bot_id": message.bot_id,
+                                                "autonomous": isinstance(message, ProactiveEvent),
+                                                "last_message_at": conversation.updated_at.isoformat() if session.recent_messages or session.summary_through_seq else None,
+                                                "conversation_type": message.conversation_type.value})
+                context = conversation, session, turn
+            else:
+                context = self.record_user_message(message)
             yield context
         finally:
             self._active.remove(message.conversation_id)
@@ -56,7 +67,7 @@ class ContextManager:
         self.store.delete_conversation(conversation_id)
         del self._last_used[conversation_id]
 
-    def get_or_create_context(self, message: MessageReceived) -> tuple[Conversation, Session]:
+    def get_or_create_context(self, message: MessageReceived | ProactiveEvent) -> tuple[Conversation, Session]:
         if not getattr(self.store, "persistent", False):
             self.cleanup_expired()
         conversation = self.store.get_conversation(message.conversation_id)
@@ -119,7 +130,7 @@ class ContextManager:
 
         return conversation, session, context_message
 
-    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime, source_message_id: int | None = None, reply_to_message_id: int | None = None) -> ContextMessage:
+    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime, source_message_id: int | None = None, reply_to_message_id: int | None = None, proactive: bool = False) -> ContextMessage:
         context_message = ContextMessage(
             id=uuid4().hex,
             role=ContextRole.ASSISTANT,
@@ -128,6 +139,8 @@ class ContextManager:
             source_message_id=source_message_id,
             metadata={"reply_to_message_id": reply_to_message_id} if reply_to_message_id is not None else {},
         )
+        if proactive:
+            context_message.metadata["proactive_reply"] = True
 
         self._append_message(session, context_message)
 

@@ -5,7 +5,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 
 from .router import RouteDecision, decide_route
-from .schema import ConversationType, MessageReceived
+from .schema import ConversationType, MessageReceived, ProactiveEvent
 from .schema import AudioContent, FileContent, ImageContent, TextContent, MentionContent
 from .settings import Settings
 from .transport import DeliveryError
@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class MessageJob:
-    message: MessageReceived
+    message: MessageReceived | ProactiveEvent
     deadline: float
     reply_started: bool = False
     proactive: bool = False
@@ -92,24 +92,44 @@ class MessageDispatcher:
         return True
 
     @staticmethod
-    def _can_merge(first: MessageReceived, second: MessageReceived) -> bool:
+    def _can_merge(first: MessageReceived | ProactiveEvent, second: MessageReceived | ProactiveEvent) -> bool:
         return (isinstance(first, MessageReceived) and isinstance(second, MessageReceived)
                 and first.sender.id == second.sender.id and bool(first.text and second.text)
                 and all(isinstance(part, (TextContent, MentionContent))
                         and (not isinstance(part, MentionContent) or part.target_id == item.bot_id)
                         for item in (first, second) for part in item.content))
 
+    def submit_proactive(self, event: ProactiveEvent) -> bool:
+        cid = event.conversation_id
+        if self._closed or cid in self._workers or self._waiting >= self.settings.queue_limit:
+            return False
+        self._queues[cid] = deque([MessageJob(event, asyncio.get_running_loop().time() + self.settings.task_timeout, proactive=True)])
+        self._activity[cid] = asyncio.Event()
+        self._waiting += 1
+        self._workers[cid] = asyncio.create_task(self._work(cid))
+        return True
 
     async def _work(self, conversation_id: str) -> None:
         queue = self._queues[conversation_id]
         activity = self._activity[conversation_id]
         followup = None
         try:
-            while queue:
+            while queue or followup is not None:
                 queued = bool(queue)
                 if queue:
                     job = queue[0]
                     followup = None
+                else:
+                    # 等待期间不占模型并发额度；新消息唤醒同一个会话 worker。
+                    activity.clear()
+                    try:
+                        await asyncio.wait_for(activity.wait(), self.settings.proactive_idle_seconds)
+                    except TimeoutError:
+                        job = MessageJob(followup, asyncio.get_running_loop().time() + self.settings.task_timeout, proactive=True)
+                        followup = None
+                    else:
+                        followup = None
+                        continue
                 taken = False
                 source_id = job.message.message_id if isinstance(job.message, MessageReceived) else "proactive"
                 try:
@@ -136,7 +156,13 @@ class MessageDispatcher:
                                     self._waiting -= 1
                                 source_id = job.message.message_id if isinstance(job.message, MessageReceived) else "proactive"
                             self._running[conversation_id] = job
-                            await self.handler(job)
+                            if job.proactive:
+                                if not activity.is_set():
+                                    await self._run_proactive(job, activity)
+                            else:
+                                await self.handler(job)
+                                if job.reply_started and job.message.conversation_type is ConversationType.PRIVATE and self.settings.proactive_idle_seconds > 0:
+                                    followup = job.message
                 except DeliveryError as exc:
                     logger.warning("发送未确认 conversation=%s message=%s: %s", conversation_id, source_id, exc)
                 except TimeoutError:
@@ -166,6 +192,19 @@ class MessageDispatcher:
             self._workers.pop(conversation_id, None)
             self._activity.pop(conversation_id, None)
 
+    async def _run_proactive(self, job: MessageJob, activity: asyncio.Event) -> None:
+        generation = asyncio.create_task(self.handler(job))
+        interrupted = asyncio.create_task(activity.wait())
+        try:
+            done, _ = await asyncio.wait([generation, interrupted], return_when=asyncio.FIRST_COMPLETED)
+            if generation in done:
+                await generation
+        finally:
+            for task in (generation, interrupted):
+                if not task.done():
+                    task.cancel()
+            # 确保旧上下文已经释放，再处理刚收到的用户消息。
+            await asyncio.gather(generation, interrupted, return_exceptions=True)
 
     def _notify(self, message: MessageReceived, text: str) -> None:
         if self._closed or decide_route(message) is not RouteDecision.REPLY:

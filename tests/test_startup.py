@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 import io
 import os
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -17,6 +18,18 @@ from tests.helpers import message
 
 
 class SettingsTests(unittest.TestCase):
+    def test_chat_timing_accepts_zero_and_rejects_invalid_values(self):
+        with patch.dict(os.environ, {"NAPCAT_TOKEN": "test", "CHAT_REPLY_INTERVAL": "0", "CHAT_INPUT_DEBOUNCE_SECONDS": "0", "CHAT_PROACTIVE_IDLE_SECONDS": "0"}, clear=True):
+            settings = Settings.from_env()
+        self.assertEqual(settings.reply_interval, 0)
+        self.assertEqual(settings.input_debounce_seconds, 0)
+        self.assertEqual(settings.proactive_idle_seconds, 0)
+        for key in ('CHAT_REPLY_INTERVAL', 'CHAT_INPUT_DEBOUNCE_SECONDS', 'CHAT_PROACTIVE_IDLE_SECONDS'):
+            for value in ('-1', 'nan', 'inf'):
+                with self.subTest(key=key, value=value), patch.dict(os.environ, {'NAPCAT_TOKEN': 'test', key: value}, clear=True):
+                    with self.assertRaises(ValueError):
+                        Settings.from_env()
+
     def test_connection_config_uses_code_runtime_settings(self):
         env = {
             "NAPCAT_TOKEN": "test",
@@ -55,23 +68,26 @@ class SettingsTests(unittest.TestCase):
 
 
 class StartupTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.data_dir = self.enterContext(tempfile.TemporaryDirectory())
+
     async def test_missing_jev_key_does_not_prevent_startup_and_resources_close(self):
         fake_agent = SimpleNamespace(client=SimpleNamespace(close=AsyncMock()))
         captured = []
         cleanup_tasks = []
 
-        async def serve_once(settings, transport, dispatcher):
+        async def serve_once(settings, transport, dispatcher, media=None):
             captured.extend([transport, dispatcher])
-            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() == "context-cleanup")
+            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() in ("context-cleanup", "group-proactive"))
 
-        with patch.dict(os.environ, {"NAPCAT_TOKEN": "test"}, clear=True), patch("qqbot.listen.load_dotenv"), patch("qqbot.listen.logging.basicConfig"), patch("qqbot.listen.Agent", return_value=fake_agent), patch("qqbot.listen.AsyncTypeSafeClient") as jev, patch("qqbot.listen.serve", side_effect=serve_once):
+        with patch.dict(os.environ, {"NAPCAT_TOKEN": "test", "BOT_DATA_DIR": self.data_dir}, clear=True), patch("qqbot.listen.load_dotenv"), patch("qqbot.listen.logging.basicConfig"), patch("qqbot.listen.Agent", return_value=fake_agent), patch("qqbot.listen.AsyncTypeSafeClient") as jev, patch("qqbot.listen.serve", side_effect=serve_once):
             await main()
         jev.assert_not_called()
         fake_agent.client.close.assert_awaited_once()
         self.assertTrue(captured[0]._closed)
         self.assertTrue(captured[1]._closed)
-        self.assertEqual(len(cleanup_tasks), 1)
-        self.assertTrue(cleanup_tasks[0].cancelled())
+        self.assertEqual(len(cleanup_tasks), 2)
+        self.assertTrue(all(task.cancelled() for task in cleanup_tasks))
 
     async def test_cancelling_service_cleans_all_resources(self):
         fake_agent = SimpleNamespace(client=SimpleNamespace(close=AsyncMock()))
@@ -79,13 +95,13 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         captured = []
         cleanup_tasks = []
 
-        async def serve_forever(settings, transport, dispatcher):
+        async def serve_forever(settings, transport, dispatcher, media=None):
             captured.extend([transport, dispatcher])
-            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() == "context-cleanup")
+            cleanup_tasks.extend(task for task in asyncio.all_tasks() if task.get_name() in ("context-cleanup", "group-proactive"))
             ready.set()
             await asyncio.Event().wait()
 
-        with patch.dict(os.environ, {"NAPCAT_TOKEN": "test"}, clear=True), patch("qqbot.listen.load_dotenv"), patch("qqbot.listen.logging.basicConfig"), patch("qqbot.listen.Agent", return_value=fake_agent), patch("qqbot.listen.serve", side_effect=serve_forever):
+        with patch.dict(os.environ, {"NAPCAT_TOKEN": "test", "BOT_DATA_DIR": self.data_dir}, clear=True), patch("qqbot.listen.load_dotenv"), patch("qqbot.listen.logging.basicConfig"), patch("qqbot.listen.Agent", return_value=fake_agent), patch("qqbot.listen.serve", side_effect=serve_forever):
             task = asyncio.create_task(main())
             await ready.wait()
             task.cancel()
@@ -94,8 +110,8 @@ class StartupTests(unittest.IsolatedAsyncioTestCase):
         fake_agent.client.close.assert_awaited_once()
         self.assertTrue(captured[0]._closed)
         self.assertTrue(captured[1]._closed)
-        self.assertEqual(len(cleanup_tasks), 1)
-        self.assertTrue(cleanup_tasks[0].cancelled())
+        self.assertEqual(len(cleanup_tasks), 2)
+        self.assertTrue(all(task.cancelled() for task in cleanup_tasks))
 
     async def test_real_agent_tool_loop_returns_answer_without_recording_unsent_reply(self):
         def response(content=None, calls=None):

@@ -239,6 +239,21 @@ class ReplyPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plain, [{"type": "text", "data": {"text": "好呀。"}}])
         self.assertEqual(self.replies(), ["周六见。", "好呀。"])
 
+    async def test_old_reply_style_is_not_the_current_style_example(self):
+        incoming = message(1, group_id=30, mentioned=True)
+        conversation, session, _ = self.manager.record_user_message(incoming)
+        old_answer = '宝宝呀～我是糖糖，快来抱抱！今天累不累呀？'
+        self.manager.record_assistant_message(conversation=conversation, session=session, content=old_answer,
+                                             timestamp=incoming.timestamp, source_message_id=501, reply_to_message_id=1)
+        self.completion.return_value = response('我是糖糖。')
+        await self.deliver(message(2, group_id=30, mentioned=True))
+        request = self.completion.await_args.kwargs['messages']
+        self.assertEqual(request[-2]['role'], 'system')
+        self.assertIn('历史助手回复不是当前表达方式的示例', request[-2]['content'])
+        self.assertEqual(request[-1]['role'], 'user')
+        self.assertIn('[消息ID:2]', request[-1]['content'])
+        self.assertEqual(request[2], {'role': 'assistant', 'content': '[引用消息ID:1] [消息ID:501] ' + old_answer})
+        self.assertEqual(self.replies(), [old_answer, '我是糖糖。'])
 
     async def test_private_reply_never_quotes_even_if_model_emits_marker(self):
         self.completion.return_value = response(f"{QUOTE_MARKER}\n你好。")

@@ -600,6 +600,8 @@ class Agent:
         for context_message in context.recent_messages:
             messages.append(self._context_message_to_llm(context_message, conversation_id))
 
+        if context.recent_messages and not context.current_turn.metadata.get("proactive"):
+            messages.append({"role": "system", "content": "以上只是在先前发生过的聊天，历史助手回复不是当前表达方式的示例。保留历史事实和情绪，但本轮只回应当前用户输入，不续写旧回复。简单身份或确认问题，直接回答核心信息就停，不追加撒娇、猜测用户状态或反问。"})
         if context.current_turn.metadata.get("batch_message_ids"):
             messages.append({"role": "system", "content": f"本轮用户连续发送的消息 ID 是 {context.current_turn.metadata['batch_message_ids']}。它们是一组尚未回复的输入，把同一话题的补充合起来理解、统一接话，不逐条回答，也不只回答最后一句。简单接话就够时，不额外展开步骤或追问。"})
 

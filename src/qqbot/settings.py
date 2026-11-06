@@ -14,6 +14,7 @@ class Settings:
     task_timeout: float = 120.0
     action_timeout: float = 10.0
     llm_timeout: float = 60.0
+    reply_interval: float = 0.8
     input_debounce_seconds: float = 1.2
     proactive_idle_seconds: float = 900.0
     intent_timeout: float = 10.0
@@ -47,7 +48,7 @@ class Settings:
         if not ws_url.startswith(("ws://", "wss://")):
             raise ValueError("NAPCAT_WS_URL 必须使用 ws:// 或 wss://")
         values = dict(ws_url=ws_url, token=token)
-        for field, env in (('input_debounce_seconds', 'CHAT_INPUT_DEBOUNCE_SECONDS'), ('proactive_idle_seconds', 'CHAT_PROACTIVE_IDLE_SECONDS')):
+        for field, env in (('reply_interval', 'CHAT_REPLY_INTERVAL'), ('input_debounce_seconds', 'CHAT_INPUT_DEBOUNCE_SECONDS'), ('proactive_idle_seconds', 'CHAT_PROACTIVE_IDLE_SECONDS')):
             raw = os.getenv(env, "").strip()
             if raw:
                 value = float(raw)

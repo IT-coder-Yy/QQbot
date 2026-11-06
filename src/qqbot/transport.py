@@ -109,7 +109,7 @@ class NapCatTransport:
         logger.info("[已发送][群:%s] Agent：%s", group_id, message[-1]["data"]["text"])
         return message_id
 
-    async def reply_text(self, message: MessageReceived, text: str, *, quote: bool = False, deadline: float | None = None) -> int:
+    async def reply_text(self, message: MessageReceived, text: str, *, quote: bool = False, reply_to_message_id: int | None = None, deadline: float | None = None) -> int:
         """
         对收到的 MessageReceived 进行回复。
 
@@ -117,7 +117,7 @@ class NapCatTransport:
         使用 QQ 的引用回复。
         """
 
-        reply_to_message_id = message.message_id if quote else None
+        reply_to_message_id = message.message_id if quote else reply_to_message_id
 
         if message.conversation_type is ConversationType.PRIVATE:
             return await self.send_private_text(

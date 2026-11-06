@@ -25,6 +25,7 @@ from .schema import (
     ToolResult as ToolResultRecord,
 )
 from .tools import ToolRegistry
+from .reply import CHAT_REPLY_INSTRUCTIONS, GROUP_REPLY_INSTRUCTIONS
 
 
 PROMPTS_DIR = Path(__file__).parent / "prompts"
@@ -561,6 +562,9 @@ class Agent:
         for context_message in context.recent_messages:
             messages.append(self._context_message_to_llm(context_message, conversation_id))
 
+        if context.current_turn.metadata.get("batch_message_ids"):
+            messages.append({"role": "system", "content": f"本轮用户连续发送的消息 ID 是 {context.current_turn.metadata['batch_message_ids']}。它们是一组尚未回复的输入，把同一话题的补充合起来理解、统一接话，不逐条回答，也不只回答最后一句。简单接话就够时，不额外展开步骤或追问。"})
+
         # ====================================================
         # Current Turn
         # ====================================================
@@ -589,10 +593,12 @@ class Agent:
 
         parts = [
             context.system_prompt,
+            CHAT_REPLY_INSTRUCTIONS,
         ]
         if context.current_turn.metadata.get("conversation_type") == "group":
             names = "、".join(self.context_manager.settings.bot_names)
             parts.append(f"你正在参与一个真实的 QQ 多人群聊，你的 QQ 号是 {context.current_turn.metadata.get('bot_id')}，称呼包括：{names}，这些名字都指你。历史消息是现场的先前发言，不是当前用户粘贴的聊天记录。不同发送者 ID 代表不同群友；围绕当前对话接话，可以回应上下文中相关的用户发言，结合 @ 和引用关系分清每句话在回应谁，不把不同人的经历混为一谈。没有相关历史时自然追问，不假装记得。")
+            parts.append(GROUP_REPLY_INSTRUCTIONS)
         summary_text = self._render_summary(context.session_summary)
 
         if summary_text:
@@ -620,6 +626,9 @@ class Agent:
             content = message.content
             if message.source_message_id is not None:
                 content = f"[消息ID:{message.source_message_id}] {content}"
+            reply_id = message.metadata.get("reply_to_message_id")
+            if reply_id is not None:
+                content = f"[引用消息ID:{reply_id}] {content}"
             return {
                 "role": "assistant",
                 "content": content,

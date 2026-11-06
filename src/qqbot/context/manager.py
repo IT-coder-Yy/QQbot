@@ -119,13 +119,14 @@ class ContextManager:
 
         return conversation, session, context_message
 
-    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime, source_message_id: int | None = None) -> ContextMessage:
+    def record_assistant_message(self, *, conversation: Conversation, session: Session, content: str, timestamp: datetime, source_message_id: int | None = None, reply_to_message_id: int | None = None) -> ContextMessage:
         context_message = ContextMessage(
             id=uuid4().hex,
             role=ContextRole.ASSISTANT,
             content=content,
             timestamp=timestamp,
             source_message_id=source_message_id,
+            metadata={"reply_to_message_id": reply_to_message_id} if reply_to_message_id is not None else {},
         )
 
         self._append_message(session, context_message)

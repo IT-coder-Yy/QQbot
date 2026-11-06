@@ -19,6 +19,7 @@ from .context import ContextBuilder, ContextManager, InMemoryContextStore
 from .dispatcher import MessageDispatcher, MessageJob
 from .intent import IntentDetector, should_respond
 from .normalizer import normalize_event
+from .reply import parse_reply
 from .router import RouteDecision, decide_route
 from .schema import ContextRole, ConversationType, MessageReceived
 from .settings import Settings
@@ -69,17 +70,34 @@ async def handle_message(
                                         fallback_timeout=context_manager.settings.intent_fallback_timeout, store=store):
                 return
 
-        reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
+        quote_ids = {item.source_message_id for item in session.recent_messages
+                     if item.role is ContextRole.USER and item.source_message_id is not None and not item.recalled
+                     and message.conversation_type is ConversationType.GROUP}
+        if message.conversation_type is ConversationType.GROUP and current_turn.source_message_id is not None:
+            quote_ids.add(current_turn.source_message_id)
+        reply = None
+        if reply is None:
+            reply = await agent.run(message=message, conversation=conversation, session=session, current_turn=current_turn)
         if job.superseded:
             return
-        if not reply.strip():
+        replies = parse_reply(reply, current_message_id=message.message_id, quote_ids=quote_ids)
+        if not replies:
             raise RuntimeError("模型返回了空白回复")
-        if asyncio.get_running_loop().time() >= job.deadline:
-            raise TimeoutError
-        job.reply_started = True
-        message_id = await transport.reply_text(message, reply, deadline=job.deadline)
-        context_manager.record_assistant_message(conversation=conversation, session=session, content=reply,
-            timestamp=datetime.now(tz=message.timestamp.tzinfo), source_message_id=message_id)
+        for index, (reply, quote_id) in enumerate(replies):
+            if index:
+                await asyncio.sleep(context_manager.settings.reply_interval)
+            if job.superseded:
+                return
+            if asyncio.get_running_loop().time() >= job.deadline:
+                raise TimeoutError
+            # 每条独立确认并入库；中途失败时保留已经送达的部分。
+            job.reply_started = True
+            message_id = await transport.reply_text(message, reply, reply_to_message_id=quote_id, deadline=job.deadline)
+            context_manager.record_assistant_message(
+                conversation=conversation, session=session, content=reply,
+                timestamp=datetime.now(tz=message.timestamp.tzinfo), source_message_id=message_id,
+                reply_to_message_id=quote_id,
+            )
 
 
 async def cleanup_contexts(context_manager: ContextManager) -> None:

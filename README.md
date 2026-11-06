@@ -1,103 +1,98 @@
-# QQBot
+<div align="center">
 
-基于 NapCat、OneBot 11 正向 WebSocket 和 OpenAI 兼容接口的 QQ 聊天机器人。QQBot 作为客户端连接 NapCat 的 WebSocket 服务端。
+<h1>QQBot</h1>
 
-## 当前功能
+<p><strong>A conversation-first QQ agent.</strong></p>
 
-- 私聊、群聊 @Bot 直接回复；配置 Jev 后，普通群聊消息也可经过意图判断触发回复。
-- 主模型支持多轮工具调用：计算器、时间、天气，以及可选的 Tavily 网页搜索。
-- 会话上下文保存在内存中，按 Token 预算压缩旧历史为摘要。
-- 同一会话顺序处理，不同会话有限并发；群聊回复引用触发消息。
-- 网络异常自动退避重连；接收循环独立分发事件与发送回执。
-- 消息去重、有界排队、任务总超时、限频的繁忙和错误提示。
+<p>Chat naturally, understand images, speak back, and pick up where you left off.</p>
 
-图片、引用、撤回和群文件已有部分内部模型，但图片理解、引用内容读取、撤回历史更新和文件处理尚未接入。长期记忆和跨重启任务恢复尚未实现。
+<p>
+  <img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python 3.12+">
+  <img src="https://img.shields.io/badge/NapCat-OneBot%2011-52B7A5" alt="NapCat · OneBot 11">
+  <img src="https://img.shields.io/badge/LLM-OpenAI%20compatible-E7B679" alt="OpenAI-compatible models">
+  <img src="https://img.shields.io/badge/Storage-SQLite-617F91?logo=sqlite&logoColor=white" alt="SQLite storage">
+</p>
 
-## 安装与配置
+<p><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
 
-要求 Python 3.12+、uv、已运行的 NapCat，以及支持工具调用的 OpenAI 兼容模型接口。
+</div>
+
+## Preview
+
+![Animated concept preview of QQBot chat, voice, vision, and memory](assets/qqbot-preview.gif)
+
+<sub>Illustrated feature preview · <a href="assets/qqbot-preview.png">View the still image</a></sub>
+
+## Features
+
+- **Natural replies** — Responds to private messages, mentions, and contextually relevant group conversations, with short message bursts and selective quoting.
+- **Proactive groups** — Chooses topics and follow-up times in joined groups, within a default activity window of 10:00–23:00 Asia/Shanghai.
+- **Voice & expression** — Speaks with Edge TTS, sends images, GIFs and QQ emoji, and searches, reuses or saves account-favorite stickers.
+- **Multimodal input** — Understands images and reads PDF, Word, Excel and text files, with SiliconFlow for OCR and voice transcription.
+- **Persistent memory** — Saves conversations, summaries and attachments across restarts, with conversation-scoped retrieval and automatic storage limits.
+- **Practical tools** — Uses a calculator, current time, weather and optional Tavily web search through the model's tool-calling loop.
+- **Reliable messaging** — Deduplicates events, preserves conversation order, reconnects automatically and records confirmed deliveries without replaying uncertain sends.
+
+## Installation & configuration
+
+Requires **Python 3.12+**, **uv**, a running **NapCat** instance with QQ logged in, and an **OpenAI-compatible model** with tool calling; image input also requires vision support.
+
+### 1. Install
 
 ```bash
+git clone https://github.com/IT-coder-Yy/QQbot.git
+cd QQbot
 uv sync
 cp .env.example .env
 ```
 
-在 NapCat 中启用**正向 WebSocket 服务端**，配置 Token 和 Array 消息格式，然后填写 `.env`。已有 `.env` 时直接补充配置，不要覆盖原凭据。
+### 2. Connect your services
 
-| 变量 | 说明 |
-| --- | --- |
-| `NAPCAT_WS_URL` | NapCat 正向 WebSocket 地址，默认 `ws://127.0.0.1:3001` |
-| `NAPCAT_TOKEN` | 必填，NapCat WebSocket 鉴权 Token |
-| `LLM_API_KEY` | 必填，主模型密钥 |
-| `LLM_BASE_URL` | 必填，OpenAI 兼容接口地址 |
-| `LLM_MODEL` | 必填，模型名称 |
-| `LLM_CONTEXT_WINDOW` | 必填，所选模型支持的上下文 Token 上限 |
-| `LLM_MAX_OUTPUT_TOKENS` | 必填，单次输出 Token 上限 |
-| `LLM_CONTEXT_SAFETY_MARGIN` | 必填，Token 估算误差的预留空间 |
-| `TYPESAFE_API_KEY` | 可选；未配置时仅响应私聊和 @Bot |
-| `TYPESAFE_DEFAULT_MODEL` | Jev 模型，默认 `jev-latest` |
-| `TAVILY_SEARCH_API_KEY` | 可选；配置后注册网页搜索工具 |
+In NapCat, enable a **forward WebSocket server**, set an authentication token, and choose **Array** message format. QQBot connects to this server as a client. Fill in the matching credentials in `.env`:
 
-三个 Token 配置需按模型实际限制填写，输出上限与预留空间之和必须小于上下文上限。`.env` 和 API 密钥不要提交到 Git。
+| Service | Variables | Purpose |
+| --- | --- | --- |
+| **NapCat · required** | `NAPCAT_WS_URL`, `NAPCAT_TOKEN` | WebSocket address and matching token; the example uses `ws://127.0.0.1:3001`. |
+| **LLM · required** | `LLM_BASE_URL`, `LLM_API_KEY`, `LLM_MODEL` | Your model provider's endpoint, API key and model name. |
+| **Edge TTS** | `TTS_VOICE` | Voice replies; defaults to `zh-CN-XiaoxiaoNeural` and needs no API key. |
+| **SiliconFlow · optional** | `SILICONFLOW_API_KEY` | Enables OCR and voice transcription; endpoint and model names are in `.env.example`. |
+| **Web search · optional** | `TAVILY_SEARCH_API_KEY` | Enables Tavily web search for current information and source links. |
+| **Jev · optional** | `TYPESAFE_API_KEY`, `TYPESAFE_DEFAULT_MODEL` | Decides when to join ordinary group conversations; defaults to `jev-latest`. |
 
-`.env` 只维护上述连接、模型与密钥配置。超时、并发、队列、重连、去重、上下文保留及意图判断参数直接在 [settings.py](src/qqbot/settings.py) 中调整；工具调用轮数和结果长度限制在 [agent.py](src/qqbot/agent.py) 中调整。原有运行参数环境变量不再生效。
+The `qwen3.7-plus` preset uses built-in model limits. **For other models**, also set `LLM_CONTEXT_WINDOW` and `LLM_MAX_OUTPUT_TOKENS` to values supported by your provider; both are included as commented examples. The output limit plus the default 8,192-token safety margin must fit inside the context window.
 
-## 运行
+To browse available TTS voices, run `uv run edge-tts --list-voices`. Existing deployments can keep their current `.env`; the example only lists service configuration. Advanced runtime options remain in [settings.py](src/qqbot/settings.py).
 
-以下两种方式都启动监听器：
+For legacy `.doc` / `.xls` files and Office chart rendering, install LibreOffice and suitable fonts. On Ubuntu/Debian:
+
+```bash
+sudo apt-get install libreoffice-writer libreoffice-calc fonts-noto-cjk
+```
+
+### 3. Make it yours
+
+Edit [system.md](src/qqbot/prompts/system.md) to change the bot's personality, tone and chat style. Edit [intent.md](src/qqbot/prompts/intent.md) to change when it joins group conversations. **Restart the bot after editing prompts.**
+
+## Run
 
 ```bash
 uv run qqbot
-uv run python -m qqbot.listen
 ```
 
-成功连接后日志会输出“已连接 NapCat”。按 Ctrl+C 退出会取消未完成任务并关闭连接和客户端。
+The log prints `已连接 NapCat` when connected. Chat history and attachments live in `data/` by default; keep this directory when restarting or redeploying.
 
-## 消息可靠性边界
-
-- 接收循环不等待模型执行或队列空位，确保队列满时仍可处理发送回执。
-- 任务总期限覆盖排队、意图判断、主模型、工具、等待重连和发送确认；重连不重新计时。
-- 队列满时拒绝新消息；等待到期则放弃该任务。私聊和 @Bot 尝试发送一次限频提示，普通群聊自动接话可以跳过。
-- 故障提示只在当前连接可用时尝试一次，有独立的并发上限和发送超时；断线或提示额度已满时可能保持沉默。
-- 仅在收到 `status=ok`、`retcode=0` 且包含 `message_id` 的同步回执后，将机器人回复写入历史。
-- 明确失败、回执超时、中途断线、异步回执或不完整回执不会自动重发。发送结果未知时只记录日志，不补发“发送失败”提示，避免重复回复。
-- 尚未尝试发送的任务可在原期限内等待重连；已经发起发送的任务不会在新连接上重放。
-- 去重键是 `(conversation_id, message_id)`。已接纳、已拒绝和失败的事件都计入去重缓存，正在排队或执行的事件另行保护。用户主动重试需发送一条新消息。
-- **全部状态仅在当前进程内保存**。不保证跨重启恢复、恰好一次投递或补回断线期间未收到的消息。会话历史也会随重启丢失。
-- 鉴权失败等非暂时性连接错误会终止启动，应修正配置后重新运行。
-
-## 上下文保留边界
-
-- 每个会话的近期历史最多保留 **200 条消息、64,000 字符**，字符数包含正文和发送者昵称。用户消息与已确认发送成功的机器人回复共用额度，超限时删除最旧的历史；已有摘要不受裁剪影响。
-- 限制在每次写入时生效，普通群聊即使一直不触发回复也不会无限积累历史。单条消息超过字符上限时，本轮仍使用完整输入，但不留在历史中；超长回复也不留存。
-- 最多缓存 **256 个会话**。容量满时淘汰最久未使用的空闲会话；等待意图判断、模型、工具或发送回执的会话受保护。若全部会话都在处理中，新会话本次处理失败，待空闲后可发新消息重试。
-- 会话闲置 **24 小时**后删除，使用本地单调时钟计时，每 **60 秒**清理一次，接收新消息时也会清理。一次处理结束后重新计算闲置时间，退出时停止清理任务。
-- 会话淘汰会删除其历史、摘要和关联运行记录，再次收到消息时从新会话开始。容量裁剪不会额外调用模型生成摘要，尚未压缩的旧历史被删除后无法恢复。
-
-## 项目结构
+## Project structure
 
 ```text
 src/qqbot/
-├── agent.py       # 主模型与工具调用循环
-├── context/       # 内存会话、Token 预算和摘要压缩
-├── dispatcher.py  # 会话队列、并发、去重、总超时及提示限频
-├── intent.py      # Jev 意图判断
-├── listen.py      # 生命周期、独立接收循环和重连
-├── normalizer.py  # OneBot 事件归一化
-├── prompts/       # 系统、意图和摘要提示词
-├── router.py      # 确定性回复规则
-├── schema.py      # 内部数据模型
-├── settings.py    # 运行配置与启动校验
-├── tools/         # 工具实现与注册
-└── transport.py   # OneBot 发送、回执关联和结果判断
+├── agent.py       # Model and tool-calling loop
+├── listen.py      # NapCat connection and message handling
+├── dispatcher.py  # Conversation queues and input batching
+├── proactive.py   # Proactive group-chat scheduling
+├── context/       # Persistent history, summaries and token budgets
+├── documents.py   # Document extraction and rendering
+├── media.py       # Incoming attachments, OCR and transcription
+├── outbound.py    # Voice, images, emoji and sticker favorites
+├── prompts/       # Personality, intent and summary prompts
+└── tools/         # Calculator, time, weather and web search
 ```
-
-## 验证
-
-测试使用标准库 unittest，模拟模型与 WebSocket；不读取真实 `.env`，不连接 QQ 或外部 API。
-
-```bash
-uv run python -m unittest discover -s tests -v
-```
-
-覆盖消息顺序、并发/队列上限、重复事件、回执乱序和丢失、断线恢复、任务期限、历史写入时机、上下文容量与过期清理、活跃会话保护、可选 Jev、配置校验和退出清理。真实 NapCat、模型及工具服务的联调需另行进行。

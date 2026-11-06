@@ -19,9 +19,11 @@
 
 ## 预览
 
-![QQBot 对话、语音、视觉与记忆功能的概念动图](assets/qqbot-preview.gif)
+<p align="center">
+  <img src="assets/qqbot-preview.gif" alt="QQBot 对话、语音、视觉与记忆功能预览" width="960">
+</p>
 
-<sub>功能概念预览 · <a href="assets/qqbot-preview.png">查看静态图</a></sub>
+<p align="center"><sub>功能概念预览 · <a href="assets/qqbot-preview.png">查看静态图</a></sub></p>
 
 ## 当前功能
 

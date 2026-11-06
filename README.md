@@ -19,9 +19,11 @@
 
 ## Preview
 
-![Animated concept preview of QQBot chat, voice, vision, and memory](assets/qqbot-preview.gif)
+<p align="center">
+  <img src="assets/qqbot-preview.gif" alt="QQBot chat, voice, vision, and memory preview" width="960">
+</p>
 
-<sub>Illustrated feature preview · <a href="assets/qqbot-preview.png">View the still image</a></sub>
+<p align="center"><sub>Illustrated feature preview · <a href="assets/qqbot-preview.png">View the still image</a></sub></p>
 
 ## Features
 

@@ -89,6 +89,9 @@ class WebSearchTool(BaseTool[WebSearchArgs]):
                 json=payload,
             )
 
+            if response.status_code == 432:
+                return json.dumps({"error": "search_quota_exceeded", "message": "搜索服务额度已用尽，本轮不要重试；恢复额度或更换可用密钥后才能查询最新信息。"}, ensure_ascii=False)
+
             response.raise_for_status()
 
             data = response.json()

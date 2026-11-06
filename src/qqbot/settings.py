@@ -44,6 +44,8 @@ class Settings:
     attachment_bytes: int = 50_000_000
     media_timeout: float = 900.0
     media_api_timeout: float = 120.0
+    tts_voice: str = "zh-CN-XiaoxiaoNeural"
+    tts_timeout: float = 30.0
     soffice: str = "soffice"
     napcat_file_root: str = ""
 
@@ -64,7 +66,7 @@ class Settings:
         if not 0 <= start < end <= 24:
             raise ValueError("主动聊天时段必须满足 0 <= 开始小时 < 结束小时 <= 24")
         values.update(proactive_timezone=zone, proactive_start_hour=start, proactive_end_hour=end)
-        for field, env in (('reply_interval', 'CHAT_REPLY_INTERVAL'), ('input_debounce_seconds', 'CHAT_INPUT_DEBOUNCE_SECONDS'), ('proactive_idle_seconds', 'CHAT_PROACTIVE_IDLE_SECONDS')):
+        for field, env in (("reply_interval", "CHAT_REPLY_INTERVAL"), ("input_debounce_seconds", "CHAT_INPUT_DEBOUNCE_SECONDS"), ("proactive_idle_seconds", "CHAT_PROACTIVE_IDLE_SECONDS")):
             raw = os.getenv(env, "").strip()
             if raw:
                 value = float(raw)
@@ -83,6 +85,8 @@ class Settings:
             ("context_cleanup_interval", "STORAGE_CLEANUP_INTERVAL", float),
             ("media_timeout", "MEDIA_TASK_TIMEOUT", float),
             ("media_api_timeout", "MEDIA_API_TIMEOUT", float),
+            ("tts_voice", "TTS_VOICE", str),
+            ("tts_timeout", "TTS_TIMEOUT", float),
             ("task_timeout", "CHAT_TASK_TIMEOUT", float),
             ("llm_timeout", "LLM_REQUEST_TIMEOUT", float),
             ("proactive_refresh_seconds", "CHAT_PROACTIVE_GROUP_REFRESH_SECONDS", float),

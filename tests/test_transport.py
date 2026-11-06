@@ -29,6 +29,32 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(action["params"]["message"][0], {"type": "reply", "data": {"id": "1"}})
         self.assertFalse(self.transport._pending)
 
+    async def test_group_list_accepts_array_response(self):
+        task = asyncio.create_task(self.transport.request('get_group_list', {}))
+        await eventually(lambda: self.ws.sent)
+        groups = [{'group_id': 30, 'group_name': '测试群'}]
+        self.transport.handle_response({**success(self.ws.sent[-1]), 'data': groups})
+        self.assertEqual(await task, groups)
+
+    async def test_generic_actions_accept_null_strings_and_non_message_results(self):
+        for data in (None, "https://example.com/result", {"tid": "post-id"}, 0, False):
+            count = len(self.ws.sent)
+            task = asyncio.create_task(self.transport.request("example_action", {}))
+            await eventually(lambda: len(self.ws.sent) > count)
+            self.transport.handle_response({**success(self.ws.sent[-1]), "data": data})
+            self.assertEqual(await task, data)
+
+    async def test_zero_message_id_is_unknown_but_negative_id_is_valid(self):
+        task = await self.start_send()
+        self.transport.handle_response(success(self.ws.sent[-1], 0))
+        with self.assertRaises(DeliveryUnknownError):
+            await task
+        task = await self.start_send()
+        self.transport.handle_response(success(self.ws.sent[-1], -123))
+        self.assertEqual(await task, -123)
+        self.assertEqual(len(self.ws.sent), 2)
+
+
     async def test_concurrent_sends_match_out_of_order_responses(self):
         first = await self.start_send()
         second = await self.start_send()
@@ -48,6 +74,7 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         for fields in [
             {"status": "async", "retcode": 1},
             {"status": "ok", "retcode": 0, "data": {}},
+            {"status": "ok", "retcode": 0, "data": []},
             {"status": "ok", "retcode": False, "data": {"message_id": 1}},
         ]:
             with self.subTest(fields=fields):

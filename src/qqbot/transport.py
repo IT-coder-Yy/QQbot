@@ -79,7 +79,7 @@ class NapCatTransport:
             reply_to_message_id=reply_to_message_id,
         )
 
-        return await self._send_action(
+        message_id = await self._send_action(
             action="send_msg",
             params={
                 "message_type": "private",
@@ -88,6 +88,8 @@ class NapCatTransport:
             },
             deadline=deadline,
         )
+        logger.info("[已发送][私聊:%s] Agent：%s", user_id, message[-1]["data"]["text"])
+        return message_id
 
     async def send_group_text(self, group_id: int, text: str, *, reply_to_message_id: int | None = None, deadline: float | None = None) -> int:
         message = self._build_text_message(
@@ -95,7 +97,7 @@ class NapCatTransport:
             reply_to_message_id=reply_to_message_id,
         )
 
-        return await self._send_action(
+        message_id = await self._send_action(
             action="send_msg",
             params={
                 "message_type": "group",
@@ -104,6 +106,8 @@ class NapCatTransport:
             },
             deadline=deadline,
         )
+        logger.info("[已发送][群:%s] Agent：%s", group_id, message[-1]["data"]["text"])
+        return message_id
 
     async def reply_text(self, message: MessageReceived, text: str, *, quote: bool = False, deadline: float | None = None) -> int:
         """
@@ -136,10 +140,20 @@ class NapCatTransport:
 
         raise ValueError(f"不支持的会话类型: {message.conversation_type}")
 
-    async def _send_action(self, action: str, params: dict[str, Any], *, deadline: float | None = None) -> int:
+
+    async def _send_action(self, action: str, params: dict[str, Any], *, deadline: float | None = None,
+                           timeout: float | None = None) -> int:
+        data = await self.request(action, params, deadline=deadline, timeout=timeout)
+        message_id = data.get("message_id") if isinstance(data, dict) else None
+        if type(message_id) is not int or message_id == 0:
+            raise DeliveryUnknownError("未收到完整的同步成功回执，结果未知")
+        return message_id
+
+    async def request(self, action: str, params: dict[str, Any], *, deadline: float | None = None, timeout: float | None = None) -> Any:
         loop = asyncio.get_running_loop()
+        action_timeout = timeout if timeout is not None else self.action_timeout
         if deadline is None:
-            deadline = loop.time() + self.action_timeout
+            deadline = loop.time() + action_timeout
         echo = str(uuid.uuid4())
         payload = {
             "action": action,
@@ -155,7 +169,7 @@ class NapCatTransport:
                     raise TimeoutError
                 future = loop.create_future()
                 self._pending[echo] = future
-                async with asyncio.timeout(self.action_timeout):
+                async with asyncio.timeout(action_timeout):
                     attempted = True
                     await websocket.send(json.dumps(payload, ensure_ascii=False))
                     response = await future
@@ -180,10 +194,9 @@ class NapCatTransport:
         if response.get("status") == "failed":
             raise DeliveryError(f"OneBot 拒绝发送，retcode={response.get('retcode')}")
         data = response.get("data")
-        message_id = data.get("message_id") if isinstance(data, dict) else None
-        if response.get("status") != "ok" or type(response.get("retcode")) is not int or response["retcode"] != 0 or type(message_id) is not int:
+        if response.get("status") != "ok" or type(response.get("retcode")) is not int or response["retcode"] != 0 or "data" not in response:
             raise DeliveryUnknownError("未收到完整的同步成功回执，结果未知")
-        return message_id
+        return data
 
     @staticmethod
     def _normalize_qq_text(text: str) -> str:
